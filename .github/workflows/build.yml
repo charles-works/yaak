@@ -1,7 +1,7 @@
 name: Generate Windows x64 Artifacts
 on:
   push:
-    branches: [master]
+    branches: [main]
 
 jobs:
   build-windows-x64:
