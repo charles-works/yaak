@@ -1,7 +1,7 @@
 name: Generate Windows x64 Artifacts
 on:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   build-windows-x64:
@@ -41,10 +41,19 @@ jobs:
         run: cargo test --all
         working-directory: src-tauri
 
-      - name: Set version
+      - name: Set version from commit date
+        shell: pwsh
+        run: |
+          # 获取当前提交的日期（格式化为 年.月.日）
+          $commitDate = git show -s --format=%ci
+          $formattedDate = [datetime]::Parse($commitDate).ToString("yyyy.MM.dd")
+          Write-Host "Setting YAAK_VERSION to: $formattedDate"
+          echo "YAAK_VERSION=$formattedDate" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Replace version in files
         run: npm run replace-version
         env:
-          YAAK_VERSION: ${{ github.sha }}
+          YAAK_VERSION: ${{ env.YAAK_VERSION }}
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -53,7 +62,7 @@ jobs:
         with:
           tagName: 'v__VERSION__'
           releaseName: 'Release __VERSION__'
-          releaseBody: '[Changelog __VERSION__](https://yaak.app/blog/__VERSION__)'
+          releaseBody: 'Changelog __VERSION__'
           releaseDraft: true
           prerelease: true
           args: '--config ./src-tauri/tauri.release.conf.json'
