@@ -54,6 +54,23 @@ jobs:
           Write-Host "Setting YAAK_VERSION to: $formattedDate"
           echo "YAAK_VERSION=$formattedDate" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Disable signing in config
+        shell: pwsh
+        run: |
+          # 读取配置文件
+          $configPath = "./src-tauri/tauri.release.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          
+          # 移除 Windows 签名命令
+          if ($config.bundle.windows.PSObject.Properties.Name -contains "signCommand") {
+              $config.bundle.windows.PSObject.Properties.Remove("signCommand")
+              Write-Host "Removed signCommand from config"
+          }
+          
+          # 保存修改后的配置
+          $config | ConvertTo-Json -Depth 10 | Set-Content $configPath
+          Write-Host "Config file updated"
+
       - name: Replace version in files
         run: npm run replace-version
         env:
@@ -63,10 +80,11 @@ jobs:
         env:
           YAAK_TARGET_ARCH: 'x64'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGN: false  # 确保禁用签名
         with:
           tagName: 'v__VERSION__'
           releaseName: 'Release __VERSION__'
-          releaseBody: 'Changelog __VERSION__'
+          releaseBody: '[Changelog __VERSION__](https://yaak.app/blog/__VERSION__)'
           releaseDraft: true
           prerelease: true
           args: '--config ./src-tauri/tauri.release.conf.json'
