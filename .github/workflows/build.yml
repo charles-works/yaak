@@ -1,0 +1,59 @@
+name: Generate Windows x64 Artifacts
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build-windows-x64:
+    permissions:
+      contents: write
+
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 40
+    
+    steps:
+      - name: Checkout yaakapp/app
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri'
+          shared-key: ci
+          cache-on-failure: true
+
+      - name: Install Protoc for plugin-runtime
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: npm ci
+      - run: npm run lint
+      - name: Run JS Tests
+        run: npm test
+      - name: Run Rust Tests
+        run: cargo test --all
+        working-directory: src-tauri
+
+      - name: Set version
+        run: npm run replace-version
+        env:
+          YAAK_VERSION: ${{ github.sha }}
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          YAAK_TARGET_ARCH: 'x64'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: 'v__VERSION__'
+          releaseName: 'Release __VERSION__'
+          releaseBody: '[Changelog __VERSION__](https://yaak.app/blog/__VERSION__)'
+          releaseDraft: true
+          prerelease: true
+          args: '--config ./src-tauri/tauri.release.conf.json'
