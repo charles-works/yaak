@@ -6,7 +6,7 @@ on:
 jobs:
   build-windows-x64:
     permissions:
-      contents: write
+      contents: write  # 必须有写入权限才能创建Release
 
     name: Build Windows x64
     runs-on: windows-latest
@@ -54,6 +54,11 @@ jobs:
           Write-Host "Setting YAAK_VERSION to: $formattedDate"
           echo "YAAK_VERSION=$formattedDate" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Replace version in files
+        run: npm run replace-version
+        env:
+          YAAK_VERSION: ${{ env.YAAK_VERSION }}
+
       - name: Disable signing in config
         shell: pwsh
         run: |
@@ -71,11 +76,6 @@ jobs:
           $config | ConvertTo-Json -Depth 10 | Set-Content $configPath
           Write-Host "Config file updated"
 
-      - name: Replace version in files
-        run: npm run replace-version
-        env:
-          YAAK_VERSION: ${{ env.YAAK_VERSION }}
-
       - uses: tauri-apps/tauri-action@v0
         env:
           YAAK_TARGET_ARCH: 'x64'
@@ -84,7 +84,35 @@ jobs:
         with:
           tagName: 'v__VERSION__'
           releaseName: 'Release __VERSION__'
-          releaseBody: '[Changelog __VERSION__](https://yaak.app/blog/__VERSION__)'
+          releaseBody: 'Changelog __VERSION__'
           releaseDraft: true
           prerelease: true
           args: '--config ./src-tauri/tauri.release.conf.json'
+
+      # 新增：上传构建产物到Release
+      - name: Upload artifacts to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          # 使用与tauri-action一致的版本标签格式
+          tag_name: v${{ env.YAAK_VERSION }}
+          name: Release v${{ env.YAAK_VERSION }}
+          draft: true
+          prerelease: true
+          # 上传构建的所有安装包文件
+          files: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+          # Release正文（可选）
+          body: |
+            ### Yaak 桌面应用 v${{ env.YAAK_VERSION }}
+            
+            **构建信息**
+            - 版本: ${{ env.YAAK_VERSION }}
+            - 平台: Windows x64
+            - 构建日期: ${{ github.event.head_commit.timestamp }}
+            
+            **安装包说明**
+            - `.msi` 文件: Windows Installer 包，适合企业部署
+            - `.exe` 文件: NSIS 安装程序，包含标准安装向导
+            
+            
