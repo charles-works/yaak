@@ -44,9 +44,13 @@ jobs:
       - name: Set version from commit date
         shell: pwsh
         run: |
-          # 获取当前提交的日期（格式化为 年.月.日）
+          # 获取当前提交的日期（格式化为 年.月.日，不带前导零）
           $commitDate = git show -s --format=%ci
-          $formattedDate = [datetime]::Parse($commitDate).ToString("yyyy.MM.dd")
+          $date = [datetime]::Parse($commitDate)
+          $year = $date.Year
+          $month = $date.Month  # 自动去掉前导零
+          $day = $date.Day      # 自动去掉前导零
+          $formattedDate = "$year.$month.$day"
           Write-Host "Setting YAAK_VERSION to: $formattedDate"
           echo "YAAK_VERSION=$formattedDate" | Out-File -FilePath $env:GITHUB_ENV -Append
 
