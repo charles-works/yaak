@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use std::{fs, panic};
+use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, RunEvent, State, WebviewWindow, is_dev};
 use tauri::{Listener, Runtime};
 use tauri::{Manager, WindowEvent};
@@ -32,6 +33,7 @@ use yaak_common::window::WorkspaceWindowTrait;
 use yaak_grpc::manager::GrpcHandle;
 use yaak_grpc::{Code, ServiceDefinition, serialize_message};
 use yaak_mac_window::AppHandleMacWindowExt;
+use yaak_models::blob_manager::BlobManagerExt;
 use yaak_models::models::{
     AnyModel, CookieJar, Environment, GrpcConnection, GrpcConnectionState, GrpcEvent,
     GrpcEventType, GrpcRequest, HttpRequest, HttpResponse, HttpResponseEvent, HttpResponseState,
@@ -40,12 +42,15 @@ use yaak_models::models::{
 use yaak_models::query_manager::QueryManagerExt;
 use yaak_models::util::{BatchUpsertResult, UpdateSource, get_workspace_export_resources};
 use yaak_plugins::events::{
-    CallGrpcRequestActionArgs, CallGrpcRequestActionRequest, CallHttpRequestActionArgs,
-    CallHttpRequestActionRequest, Color, FilterResponse, GetGrpcRequestActionsResponse,
-    GetHttpAuthenticationConfigResponse, GetHttpAuthenticationSummaryResponse,
-    GetHttpRequestActionsResponse, GetTemplateFunctionConfigResponse,
-    GetTemplateFunctionSummaryResponse, InternalEvent, InternalEventPayload, JsonPrimitive,
-    PluginContext, RenderPurpose, ShowToastRequest,
+    CallFolderActionArgs, CallFolderActionRequest, CallGrpcRequestActionArgs,
+    CallGrpcRequestActionRequest, CallHttpRequestActionArgs, CallHttpRequestActionRequest,
+    CallWebsocketRequestActionArgs, CallWebsocketRequestActionRequest, CallWorkspaceActionArgs,
+    CallWorkspaceActionRequest, Color, FilterResponse, GetFolderActionsResponse,
+    GetGrpcRequestActionsResponse, GetHttpAuthenticationConfigResponse,
+    GetHttpAuthenticationSummaryResponse, GetHttpRequestActionsResponse,
+    GetTemplateFunctionConfigResponse, GetTemplateFunctionSummaryResponse,
+    GetWebsocketRequestActionsResponse, GetWorkspaceActionsResponse, InternalEvent,
+    InternalEventPayload, JsonPrimitive, PluginContext, RenderPurpose, ShowToastRequest,
 };
 use yaak_plugins::manager::PluginManager;
 use yaak_plugins::plugin_meta::PluginMetadata;
@@ -78,6 +83,7 @@ struct AppMetaData {
     name: String,
     app_data_dir: String,
     app_log_dir: String,
+    vendored_plugin_dir: String,
     feature_updater: bool,
     feature_license: bool,
 }
@@ -86,12 +92,15 @@ struct AppMetaData {
 async fn cmd_metadata(app_handle: AppHandle) -> YaakResult<AppMetaData> {
     let app_data_dir = app_handle.path().app_data_dir()?;
     let app_log_dir = app_handle.path().app_log_dir()?;
+    let vendored_plugin_dir =
+        app_handle.path().resolve("vendored/plugins", BaseDirectory::Resource)?;
     Ok(AppMetaData {
         is_dev: is_dev(),
         version: app_handle.package_info().version.to_string(),
         name: app_handle.package_info().name.to_string(),
         app_data_dir: app_data_dir.to_string_lossy().to_string(),
         app_log_dir: app_log_dir.to_string_lossy().to_string(),
+        vendored_plugin_dir: vendored_plugin_dir.to_string_lossy().to_string(),
         feature_license: cfg!(feature = "license"),
         feature_updater: cfg!(feature = "updater"),
     })
@@ -784,7 +793,7 @@ async fn cmd_http_response_body<R: Runtime>(
 ) -> YaakResult<FilterResponse> {
     let body_path = match response.body_path {
         None => {
-            return Err(GenericError("Response body path not set".to_string()));
+            return Ok(FilterResponse { content: String::new(), error: None });
         }
         Some(p) => p,
     };
@@ -807,6 +816,23 @@ async fn cmd_http_response_body<R: Runtime>(
         }
         _ => Ok(FilterResponse { content: body, error: None }),
     }
+}
+
+#[tauri::command]
+async fn cmd_http_request_body<R: Runtime>(
+    app_handle: AppHandle<R>,
+    response_id: &str,
+) -> YaakResult<Option<Vec<u8>>> {
+    let body_id = format!("{}.request", response_id);
+    let chunks = app_handle.blobs().get_chunks(&body_id)?;
+
+    if chunks.is_empty() {
+        return Ok(None);
+    }
+
+    // Concatenate all chunks
+    let body: Vec<u8> = chunks.into_iter().flat_map(|c| c.data).collect();
+    Ok(Some(body))
 }
 
 #[tauri::command]
@@ -835,9 +861,7 @@ async fn cmd_get_http_response_events<R: Runtime>(
     app_handle: AppHandle<R>,
     response_id: &str,
 ) -> YaakResult<Vec<HttpResponseEvent>> {
-    use yaak_models::models::HttpResponseEventIden;
-    let events: Vec<HttpResponseEvent> =
-        app_handle.db().find_many(HttpResponseEventIden::ResponseId, response_id, None)?;
+    let events: Vec<HttpResponseEvent> = app_handle.db().list_http_response_events(response_id)?;
     Ok(events)
 }
 
@@ -855,6 +879,78 @@ async fn cmd_http_request_actions<R: Runtime>(
     plugin_manager: State<'_, PluginManager>,
 ) -> YaakResult<Vec<GetHttpRequestActionsResponse>> {
     Ok(plugin_manager.get_http_request_actions(&window).await?)
+}
+
+#[tauri::command]
+async fn cmd_websocket_request_actions<R: Runtime>(
+    window: WebviewWindow<R>,
+    plugin_manager: State<'_, PluginManager>,
+) -> YaakResult<Vec<GetWebsocketRequestActionsResponse>> {
+    Ok(plugin_manager.get_websocket_request_actions(&window).await?)
+}
+
+#[tauri::command]
+async fn cmd_call_websocket_request_action<R: Runtime>(
+    window: WebviewWindow<R>,
+    req: CallWebsocketRequestActionRequest,
+    plugin_manager: State<'_, PluginManager>,
+) -> YaakResult<()> {
+    let websocket_request = window.db().get_websocket_request(&req.args.websocket_request.id)?;
+    Ok(plugin_manager
+        .call_websocket_request_action(
+            &window,
+            CallWebsocketRequestActionRequest {
+                args: CallWebsocketRequestActionArgs { websocket_request },
+                ..req
+            },
+        )
+        .await?)
+}
+
+#[tauri::command]
+async fn cmd_workspace_actions<R: Runtime>(
+    window: WebviewWindow<R>,
+    plugin_manager: State<'_, PluginManager>,
+) -> YaakResult<Vec<GetWorkspaceActionsResponse>> {
+    Ok(plugin_manager.get_workspace_actions(&window).await?)
+}
+
+#[tauri::command]
+async fn cmd_call_workspace_action<R: Runtime>(
+    window: WebviewWindow<R>,
+    req: CallWorkspaceActionRequest,
+    plugin_manager: State<'_, PluginManager>,
+) -> YaakResult<()> {
+    let workspace = window.db().get_workspace(&req.args.workspace.id)?;
+    Ok(plugin_manager
+        .call_workspace_action(
+            &window,
+            CallWorkspaceActionRequest { args: CallWorkspaceActionArgs { workspace }, ..req },
+        )
+        .await?)
+}
+
+#[tauri::command]
+async fn cmd_folder_actions<R: Runtime>(
+    window: WebviewWindow<R>,
+    plugin_manager: State<'_, PluginManager>,
+) -> YaakResult<Vec<GetFolderActionsResponse>> {
+    Ok(plugin_manager.get_folder_actions(&window).await?)
+}
+
+#[tauri::command]
+async fn cmd_call_folder_action<R: Runtime>(
+    window: WebviewWindow<R>,
+    req: CallFolderActionRequest,
+    plugin_manager: State<'_, PluginManager>,
+) -> YaakResult<()> {
+    let folder = window.db().get_folder(&req.args.folder.id)?;
+    Ok(plugin_manager
+        .call_folder_action(
+            &window,
+            CallFolderActionRequest { args: CallFolderActionArgs { folder }, ..req },
+        )
+        .await?)
 }
 
 #[tauri::command]
@@ -1115,6 +1211,7 @@ async fn cmd_send_http_request<R: Runtime>(
     //   that has not yet been saved in the DB.
     request: HttpRequest,
 ) -> YaakResult<HttpResponse> {
+    let blobs = app_handle.blob_manager();
     let response = app_handle.db().upsert_http_response(
         &HttpResponse {
             request_id: request.id.clone(),
@@ -1122,6 +1219,7 @@ async fn cmd_send_http_request<R: Runtime>(
             ..Default::default()
         },
         &UpdateSource::from_window(&window),
+        &blobs,
     )?;
 
     let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
@@ -1167,28 +1265,12 @@ async fn cmd_send_http_request<R: Runtime>(
                     ..resp
                 },
                 &UpdateSource::from_window(&window),
+                &blobs,
             )?
         }
     };
 
     Ok(r)
-}
-
-fn response_err<R: Runtime>(
-    app_handle: &AppHandle<R>,
-    response: &HttpResponse,
-    error: String,
-    update_source: &UpdateSource,
-) -> HttpResponse {
-    warn!("Failed to send request: {error:?}");
-    let mut response = response.clone();
-    response.state = HttpResponseState::Closed;
-    response.error = Some(error.clone());
-    response = app_handle
-        .db()
-        .update_http_response_if_id(&response, update_source)
-        .expect("Failed to update response");
-    response
 }
 
 #[tauri::command]
@@ -1199,12 +1281,14 @@ async fn cmd_install_plugin<R: Runtime>(
     app_handle: AppHandle<R>,
     window: WebviewWindow<R>,
 ) -> YaakResult<Plugin> {
-    plugin_manager.add_plugin_by_dir(&PluginContext::new(&window), &directory).await?;
-
-    Ok(app_handle.db().upsert_plugin(
-        &Plugin { directory: directory.into(), url, ..Default::default() },
+    let plugin = app_handle.db().upsert_plugin(
+        &Plugin { directory: directory.into(), url, enabled: true, ..Default::default() },
         &UpdateSource::from_window(&window),
-    )?)
+    )?;
+
+    plugin_manager.add_plugin(&PluginContext::new(&window), &plugin).await?;
+
+    Ok(plugin)
 }
 
 #[tauri::command]
@@ -1333,43 +1417,48 @@ async fn cmd_check_for_updates<R: Runtime>(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[allow(unused_mut)]
-    let mut builder = tauri::Builder::default()
-        .plugin(
-            Builder::default()
-                .targets([
-                    Target::new(TargetKind::Stdout),
-                    Target::new(TargetKind::LogDir { file_name: None }),
-                    Target::new(TargetKind::Webview),
-                ])
-                .level_for("plugin_runtime", log::LevelFilter::Info)
-                .level_for("cookie_store", log::LevelFilter::Info)
-                .level_for("eventsource_client::event_parser", log::LevelFilter::Info)
-                .level_for("h2", log::LevelFilter::Info)
-                .level_for("hyper", log::LevelFilter::Info)
-                .level_for("hyper_util", log::LevelFilter::Info)
-                .level_for("hyper_rustls", log::LevelFilter::Info)
-                .level_for("reqwest", log::LevelFilter::Info)
-                .level_for("sqlx", log::LevelFilter::Debug)
-                .level_for("tao", log::LevelFilter::Info)
-                .level_for("tokio_util", log::LevelFilter::Info)
-                .level_for("tonic", log::LevelFilter::Info)
-                .level_for("tower", log::LevelFilter::Info)
-                .level_for("tracing", log::LevelFilter::Warn)
-                .level_for("swc_ecma_codegen", log::LevelFilter::Off)
-                .level_for("swc_ecma_transforms_base", log::LevelFilter::Off)
-                .with_colors(ColoredLevelConfig::default())
-                .level(if is_dev() { log::LevelFilter::Debug } else { log::LevelFilter::Info })
-                .build(),
-        )
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    let mut builder = tauri::Builder::default().plugin(
+        Builder::default()
+            .targets([
+                Target::new(TargetKind::Stdout),
+                Target::new(TargetKind::LogDir { file_name: None }),
+                Target::new(TargetKind::Webview),
+            ])
+            .level_for("plugin_runtime", log::LevelFilter::Info)
+            .level_for("cookie_store", log::LevelFilter::Info)
+            .level_for("eventsource_client::event_parser", log::LevelFilter::Info)
+            .level_for("h2", log::LevelFilter::Info)
+            .level_for("hyper", log::LevelFilter::Info)
+            .level_for("hyper_util", log::LevelFilter::Info)
+            .level_for("hyper_rustls", log::LevelFilter::Info)
+            .level_for("reqwest", log::LevelFilter::Info)
+            .level_for("sqlx", log::LevelFilter::Debug)
+            .level_for("tao", log::LevelFilter::Info)
+            .level_for("tokio_util", log::LevelFilter::Info)
+            .level_for("tonic", log::LevelFilter::Info)
+            .level_for("tower", log::LevelFilter::Info)
+            .level_for("tracing", log::LevelFilter::Warn)
+            .level_for("swc_ecma_codegen", log::LevelFilter::Off)
+            .level_for("swc_ecma_transforms_base", log::LevelFilter::Off)
+            .with_colors(ColoredLevelConfig::default())
+            .level(if is_dev() { log::LevelFilter::Debug } else { log::LevelFilter::Info })
+            .build(),
+    );
+
+    // Only enable single-instance in production builds. In dev mode, we want to allow
+    // multiple instances for testing and worktree workflows (running multiple branches).
+    if !is_dev() {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When trying to open a new app instance (common operation on Linux),
             // focus the first existing window we find instead of opening a new one
             // TODO: Keep track of the last focused window and always focus that one
             if let Some(window) = app.webview_windows().values().next() {
                 let _ = window.set_focus();
             }
-        }))
+        }));
+    }
+
+    builder = builder
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         // Don't restore StateFlags::DECORATIONS because we want to be able to toggle them on/off on a restart
@@ -1459,6 +1548,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             cmd_call_http_authentication_action,
             cmd_call_http_request_action,
+            cmd_call_websocket_request_action,
+            cmd_call_workspace_action,
+            cmd_call_folder_action,
             cmd_call_grpc_request_action,
             cmd_check_for_updates,
             cmd_create_grpc_request,
@@ -1468,6 +1560,7 @@ pub fn run() {
             cmd_delete_send_history,
             cmd_dismiss_notification,
             cmd_export_data,
+            cmd_http_request_body,
             cmd_http_response_body,
             cmd_format_json,
             cmd_get_http_authentication_summaries,
@@ -1479,6 +1572,9 @@ pub fn run() {
             cmd_grpc_reflect,
             cmd_grpc_request_actions,
             cmd_http_request_actions,
+            cmd_websocket_request_actions,
+            cmd_workspace_actions,
+            cmd_folder_actions,
             cmd_import_data,
             cmd_install_plugin,
             cmd_metadata,

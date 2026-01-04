@@ -5,7 +5,7 @@ import type {
 } from '@yaakapp-internal/models';
 import classNames from 'classnames';
 import { format } from 'date-fns';
-import { Fragment, type ReactNode, useMemo, useState } from 'react';
+import { type ReactNode, useMemo, useState } from 'react';
 import { useHttpResponseEvents } from '../hooks/useHttpResponseEvents';
 import { AutoScroller } from './core/AutoScroller';
 import { Banner } from './core/Banner';
@@ -20,15 +20,11 @@ interface Props {
   response: HttpResponse;
 }
 
-export function ResponseEvents({ response }: Props) {
-  return (
-    <Fragment key={response.id}>
-      <ActualResponseEvents response={response} />
-    </Fragment>
-  );
+export function HttpResponseTimeline({ response }: Props) {
+  return <Inner key={response.id} response={response} />;
 }
 
-function ActualResponseEvents({ response }: Props) {
+function Inner({ response }: Props) {
   const [activeEventIndex, setActiveEventIndex] = useState<number | null>(null);
   const { data: events, error, isLoading } = useHttpResponseEvents(response);
 
@@ -57,8 +53,8 @@ function ActualResponseEvents({ response }: Props) {
     <SplitLayout
       layout="vertical"
       name="http_response_events"
-      defaultRatio={0.5}
-      minHeightPx={20}
+      defaultRatio={0.25}
+      minHeightPx={10}
       firstSlot={() => (
         <AutoScroller
           data={events}
@@ -112,14 +108,14 @@ function EventRow({
         onClick={onClick}
         className={classNames(
           'w-full grid grid-cols-[auto_minmax(0,1fr)_auto] gap-2 items-center text-left',
-          'px-1.5 h-xs font-mono cursor-default group focus:outline-none focus:text-text rounded',
+          'px-1.5 h-xs font-mono text-editor cursor-default group focus:outline-none focus:text-text rounded',
           isActive && '!bg-surface-active !text-text',
           'text-text-subtle hover:text',
         )}
       >
         <Icon color={color} icon={icon} size="sm" />
-        <div className="w-full truncate text-xs">{summary}</div>
-        <div className="text-xs opacity-50">{format(`${event.createdAt}Z`, 'HH:mm:ss.SSS')}</div>
+        <div className="w-full truncate">{summary}</div>
+        <div className="opacity-50">{format(`${event.createdAt}Z`, 'HH:mm:ss.SSS')}</div>
       </button>
     </div>
   );
@@ -219,7 +215,7 @@ function EventDetails({ event }: { event: HttpResponseEvent }) {
     return (
       <div className="flex flex-col gap-2">
         <DetailHeader title={`Data ${direction}`} timestamp={timestamp} />
-        <div className="font-mono text-sm">{formatBytes(e.bytes)}</div>
+        <div className="font-mono text-editor">{formatBytes(e.bytes)}</div>
       </div>
     );
   }
@@ -229,7 +225,7 @@ function EventDetails({ event }: { event: HttpResponseEvent }) {
   return (
     <div className="flex flex-col gap-1">
       <DetailHeader title={label} timestamp={timestamp} />
-      <div className="font-mono text-sm">{summary}</div>
+      <div className="font-mono text-editor">{summary}</div>
     </div>
   );
 }
@@ -252,20 +248,6 @@ type EventDisplay = {
 
 function getEventDisplay(event: HttpResponseEventData): EventDisplay {
   switch (event.type) {
-    case 'start_request':
-      return {
-        icon: 'info',
-        color: 'secondary',
-        label: 'Start',
-        summary: 'Request started',
-      };
-    case 'end_request':
-      return {
-        icon: 'info',
-        color: 'secondary',
-        label: 'End',
-        summary: 'Request complete',
-      };
     case 'setting':
       return {
         icon: 'settings',
@@ -321,14 +303,14 @@ function getEventDisplay(event: HttpResponseEventData): EventDisplay {
         icon: 'info',
         color: 'secondary',
         label: 'Chunk',
-        summary: `${event.bytes} bytes sent`,
+        summary: `${formatBytes(event.bytes)} chunk sent`,
       };
     case 'chunk_received':
       return {
         icon: 'info',
         color: 'secondary',
         label: 'Chunk',
-        summary: `${event.bytes} bytes received`,
+        summary: `${formatBytes(event.bytes)} chunk received`,
       };
     default:
       return {

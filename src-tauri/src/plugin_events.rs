@@ -11,8 +11,10 @@ use cookie::Cookie;
 use log::error;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_opener::OpenerExt;
 use yaak_common::window::WorkspaceWindowTrait;
-use yaak_models::models::{HttpResponse, Plugin};
+use yaak_models::blob_manager::BlobManagerExt;
+use yaak_models::models::{AnyModel, HttpResponse, Plugin};
 use yaak_models::queries::any_request::AnyRequest;
 use yaak_models::query_manager::QueryManagerExt;
 use yaak_models::util::UpdateSource;
@@ -20,9 +22,10 @@ use yaak_plugins::error::Error::PluginErr;
 use yaak_plugins::events::{
     Color, DeleteKeyValueResponse, EmptyPayload, ErrorResponse, FindHttpResponsesResponse,
     GetCookieValueResponse, GetHttpRequestByIdResponse, GetKeyValueResponse, Icon, InternalEvent,
-    InternalEventPayload, ListCookieNamesResponse, RenderGrpcRequestResponse,
-    RenderHttpRequestResponse, SendHttpRequestResponse, SetKeyValueResponse, ShowToastRequest,
-    TemplateRenderResponse, WindowInfoResponse, WindowNavigateEvent,
+    InternalEventPayload, ListCookieNamesResponse, ListHttpRequestsResponse,
+    ListWorkspacesResponse, RenderGrpcRequestResponse, RenderHttpRequestResponse,
+    SendHttpRequestResponse, SetKeyValueResponse, ShowToastRequest, TemplateRenderResponse,
+    WindowInfoResponse, WindowNavigateEvent, WorkspaceInfo,
 };
 use yaak_plugins::plugin_handle::PluginHandle;
 use yaak_plugins::template_callback::PluginTemplateCallback;
@@ -59,6 +62,87 @@ pub(crate) async fn handle_plugin_event<R: Runtime>(
             Ok(Some(InternalEventPayload::FindHttpResponsesResponse(FindHttpResponsesResponse {
                 http_responses,
             })))
+        }
+        InternalEventPayload::ListHttpRequestsRequest(req) => {
+            let w = get_window_from_plugin_context(app_handle, &plugin_context)?;
+            let workspace = workspace_from_window(&w)
+                .ok_or(PluginErr("Failed to get workspace from window".into()))?;
+
+            let http_requests = if let Some(folder_id) = req.folder_id {
+                app_handle.db().list_http_requests_for_folder_recursive(&folder_id)?
+            } else {
+                app_handle.db().list_http_requests(&workspace.id)?
+            };
+
+            Ok(Some(InternalEventPayload::ListHttpRequestsResponse(ListHttpRequestsResponse {
+                http_requests,
+            })))
+        }
+        InternalEventPayload::ListFoldersRequest(_req) => {
+            let w = get_window_from_plugin_context(app_handle, &plugin_context)?;
+            let workspace = workspace_from_window(&w)
+                .ok_or(PluginErr("Failed to get workspace from window".into()))?;
+            let folders = app_handle.db().list_folders(&workspace.id)?;
+
+            Ok(Some(InternalEventPayload::ListFoldersResponse(
+                yaak_plugins::events::ListFoldersResponse { folders },
+            )))
+        }
+        InternalEventPayload::UpsertModelRequest(req) => {
+            use AnyModel::*;
+            let model = match &req.model {
+                HttpRequest(m) => {
+                    HttpRequest(app_handle.db().upsert_http_request(m, &UpdateSource::Plugin)?)
+                }
+                GrpcRequest(m) => {
+                    GrpcRequest(app_handle.db().upsert_grpc_request(m, &UpdateSource::Plugin)?)
+                }
+                WebsocketRequest(m) => WebsocketRequest(
+                    app_handle.db().upsert_websocket_request(m, &UpdateSource::Plugin)?,
+                ),
+                Folder(m) => Folder(app_handle.db().upsert_folder(m, &UpdateSource::Plugin)?),
+                Environment(m) => {
+                    Environment(app_handle.db().upsert_environment(m, &UpdateSource::Plugin)?)
+                }
+                Workspace(m) => {
+                    Workspace(app_handle.db().upsert_workspace(m, &UpdateSource::Plugin)?)
+                }
+                _ => {
+                    return Err(PluginErr("Upsert not supported for this model type".into()).into());
+                }
+            };
+
+            Ok(Some(InternalEventPayload::UpsertModelResponse(
+                yaak_plugins::events::UpsertModelResponse { model },
+            )))
+        }
+        InternalEventPayload::DeleteModelRequest(req) => {
+            let model = match req.model.as_str() {
+                "http_request" => AnyModel::HttpRequest(
+                    app_handle.db().delete_http_request_by_id(&req.id, &UpdateSource::Plugin)?,
+                ),
+                "grpc_request" => AnyModel::GrpcRequest(
+                    app_handle.db().delete_grpc_request_by_id(&req.id, &UpdateSource::Plugin)?,
+                ),
+                "websocket_request" => AnyModel::WebsocketRequest(
+                    app_handle
+                        .db()
+                        .delete_websocket_request_by_id(&req.id, &UpdateSource::Plugin)?,
+                ),
+                "folder" => AnyModel::Folder(
+                    app_handle.db().delete_folder_by_id(&req.id, &UpdateSource::Plugin)?,
+                ),
+                "environment" => AnyModel::Environment(
+                    app_handle.db().delete_environment_by_id(&req.id, &UpdateSource::Plugin)?,
+                ),
+                _ => {
+                    return Err(PluginErr("Delete not supported for this model type".into()).into());
+                }
+            };
+
+            Ok(Some(InternalEventPayload::DeleteModelResponse(
+                yaak_plugins::events::DeleteModelResponse { model },
+            )))
         }
         InternalEventPayload::GetHttpRequestByIdRequest(req) => {
             let http_request = app_handle.db().get_http_request(&req.id).ok();
@@ -194,6 +278,7 @@ pub(crate) async fn handle_plugin_event<R: Runtime>(
             let http_response = if http_request.id.is_empty() {
                 HttpResponse::default()
             } else {
+                let blobs = window.blob_manager();
                 window.db().upsert_http_response(
                     &HttpResponse {
                         request_id: http_request.id.clone(),
@@ -201,6 +286,7 @@ pub(crate) async fn handle_plugin_event<R: Runtime>(
                         ..Default::default()
                     },
                     &UpdateSource::Plugin,
+                    &blobs,
                 )?
             };
 
@@ -285,6 +371,10 @@ pub(crate) async fn handle_plugin_event<R: Runtime>(
             }
             Ok(None)
         }
+        InternalEventPayload::OpenExternalUrlRequest(req) => {
+            app_handle.opener().open_url(&req.url, None::<&str>)?;
+            Ok(Some(InternalEventPayload::OpenExternalUrlResponse(EmptyPayload {})))
+        }
         InternalEventPayload::SetKeyValueRequest(req) => {
             let name = plugin_handle.info().name;
             app_handle.db().set_plugin_key_value(&name, &req.key, &req.value);
@@ -352,6 +442,25 @@ pub(crate) async fn handle_plugin_event<R: Runtime>(
                 environment_id,
             })))
         }
+
+        InternalEventPayload::ListWorkspacesRequest(_) => {
+            let mut workspaces = Vec::new();
+
+            for (_, window) in app_handle.webview_windows() {
+                if let Some(workspace) = workspace_from_window(&window) {
+                    workspaces.push(WorkspaceInfo {
+                        id: workspace.id.clone(),
+                        name: workspace.name.clone(),
+                        label: window.label().to_string(),
+                    });
+                }
+            }
+
+            Ok(Some(InternalEventPayload::ListWorkspacesResponse(ListWorkspacesResponse {
+                workspaces,
+            })))
+        }
+
         _ => Ok(None),
     }
 }

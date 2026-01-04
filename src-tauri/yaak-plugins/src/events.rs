@@ -4,7 +4,8 @@ use tauri::{Runtime, WebviewWindow};
 use ts_rs::TS;
 use yaak_common::window::WorkspaceWindowTrait;
 use yaak_models::models::{
-    Environment, Folder, GrpcRequest, HttpRequest, HttpResponse, WebsocketRequest, Workspace,
+    AnyModel, Environment, Folder, GrpcRequest, HttpRequest, HttpResponse, WebsocketRequest,
+    Workspace,
 };
 use yaak_models::util::generate_prefixed_id;
 
@@ -90,6 +91,21 @@ pub enum InternalEventPayload {
     GetHttpRequestActionsResponse(GetHttpRequestActionsResponse),
     CallHttpRequestActionRequest(CallHttpRequestActionRequest),
 
+    // WebSocket Request Actions
+    GetWebsocketRequestActionsRequest(EmptyPayload),
+    GetWebsocketRequestActionsResponse(GetWebsocketRequestActionsResponse),
+    CallWebsocketRequestActionRequest(CallWebsocketRequestActionRequest),
+
+    // Workspace Actions
+    GetWorkspaceActionsRequest(EmptyPayload),
+    GetWorkspaceActionsResponse(GetWorkspaceActionsResponse),
+    CallWorkspaceActionRequest(CallWorkspaceActionRequest),
+
+    // Folder Actions
+    GetFolderActionsRequest(EmptyPayload),
+    GetFolderActionsResponse(GetFolderActionsResponse),
+    CallFolderActionRequest(CallFolderActionRequest),
+
     // Grpc Request Actions
     GetGrpcRequestActionsRequest(EmptyPayload),
     GetGrpcRequestActionsResponse(GetGrpcRequestActionsResponse),
@@ -137,6 +153,9 @@ pub enum InternalEventPayload {
     WindowCloseEvent,
     CloseWindowRequest(CloseWindowRequest),
 
+    OpenExternalUrlRequest(OpenExternalUrlRequest),
+    OpenExternalUrlResponse(EmptyPayload),
+
     ShowToastRequest(ShowToastRequest),
     ShowToastResponse(EmptyPayload),
 
@@ -146,11 +165,24 @@ pub enum InternalEventPayload {
     WindowInfoRequest(WindowInfoRequest),
     WindowInfoResponse(WindowInfoResponse),
 
+    ListWorkspacesRequest(ListWorkspacesRequest),
+    ListWorkspacesResponse(ListWorkspacesResponse),
+
     GetHttpRequestByIdRequest(GetHttpRequestByIdRequest),
     GetHttpRequestByIdResponse(GetHttpRequestByIdResponse),
 
     FindHttpResponsesRequest(FindHttpResponsesRequest),
     FindHttpResponsesResponse(FindHttpResponsesResponse),
+    ListHttpRequestsRequest(ListHttpRequestsRequest),
+    ListHttpRequestsResponse(ListHttpRequestsResponse),
+    ListFoldersRequest(ListFoldersRequest),
+    ListFoldersResponse(ListFoldersResponse),
+
+    UpsertModelRequest(UpsertModelRequest),
+    UpsertModelResponse(UpsertModelResponse),
+
+    DeleteModelRequest(DeleteModelRequest),
+    DeleteModelResponse(DeleteModelResponse),
 
     GetThemesRequest(GetThemesRequest),
     GetThemesResponse(GetThemesResponse),
@@ -466,6 +498,13 @@ pub struct OpenWindowRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_events.ts")]
+pub struct OpenExternalUrlRequest {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
 pub struct WindowSize {
     pub width: f64,
     pub height: f64,
@@ -551,6 +590,28 @@ pub struct WindowInfoResponse {
     pub request_id: Option<String>,
     pub environment_id: Option<String>,
     pub workspace_id: Option<String>,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct ListWorkspacesRequest {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct ListWorkspacesResponse {
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct WorkspaceInfo {
+    pub id: String,
+    pub name: String,
+    #[ts(skip)]
     pub label: String,
 }
 
@@ -1124,6 +1185,105 @@ pub struct CallHttpRequestActionArgs {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_events.ts")]
+pub struct GetWebsocketRequestActionsResponse {
+    pub actions: Vec<WebsocketRequestAction>,
+    pub plugin_ref_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct WebsocketRequestAction {
+    pub label: String,
+    #[ts(optional)]
+    pub icon: Option<Icon>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct CallWebsocketRequestActionRequest {
+    pub index: i32,
+    pub plugin_ref_id: String,
+    pub args: CallWebsocketRequestActionArgs,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct CallWebsocketRequestActionArgs {
+    pub websocket_request: WebsocketRequest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct GetWorkspaceActionsResponse {
+    pub actions: Vec<WorkspaceAction>,
+    pub plugin_ref_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct WorkspaceAction {
+    pub label: String,
+    #[ts(optional)]
+    pub icon: Option<Icon>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct CallWorkspaceActionRequest {
+    pub index: i32,
+    pub plugin_ref_id: String,
+    pub args: CallWorkspaceActionArgs,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct CallWorkspaceActionArgs {
+    pub workspace: Workspace,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct GetFolderActionsResponse {
+    pub actions: Vec<FolderAction>,
+    pub plugin_ref_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct FolderAction {
+    pub label: String,
+    #[ts(optional)]
+    pub icon: Option<Icon>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct CallFolderActionRequest {
+    pub index: i32,
+    pub plugin_ref_id: String,
+    pub args: CallFolderActionArgs,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct CallFolderActionArgs {
+    pub folder: Folder,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
 pub struct GetGrpcRequestActionsResponse {
     pub actions: Vec<GrpcRequestAction>,
     pub plugin_ref_id: String,
@@ -1183,6 +1343,62 @@ pub struct FindHttpResponsesRequest {
 #[ts(export, export_to = "gen_events.ts")]
 pub struct FindHttpResponsesResponse {
     pub http_responses: Vec<HttpResponse>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct ListHttpRequestsRequest {
+    #[ts(optional)]
+    pub folder_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct ListHttpRequestsResponse {
+    pub http_requests: Vec<HttpRequest>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default)]
+#[ts(export, type = "{}", export_to = "gen_events.ts")]
+pub struct ListFoldersRequest {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct ListFoldersResponse {
+    pub folders: Vec<Folder>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct UpsertModelRequest {
+    pub model: AnyModel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct UpsertModelResponse {
+    pub model: AnyModel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct DeleteModelRequest {
+    pub model: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_events.ts")]
+pub struct DeleteModelResponse {
+    pub model: AnyModel,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
