@@ -79,12 +79,12 @@ jobs:
       - name: 🔧 Install Windows Build Dependencies
         shell: pwsh
         run: |
-          Write-Host "Installing WebView2 Runtime (for bundler)..."
+          Write-Host "Installing WebView2 Runtime..."
           $webview2Url = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
           $installer = "$env:TEMP\MicrosoftEdgeWebview2Setup.exe"
           Invoke-WebRequest -Uri $webview2Url -OutFile $installer
           Start-Process -FilePath $installer -ArgumentList '/silent', '/install' -Wait
-          Write-Host "✅ WebView2 Runtime installed"
+          Write-Host "✅ WebView2 installed"
           
           Write-Host "Installing protoc..."
           choco install protoc -y --no-progress
@@ -98,41 +98,35 @@ jobs:
         env:
           YAAK_TARGET_ARCH: x64
 
-      - name: 🏗️ Build Windows Application with Bundler
-        shell: pwsh
-        run: |
-          Write-Host "Building with Tauri bundler enabled..."
-          
-          # ✅ 关键修复：使用 --bundles 参数强制生成安装包
-          # 默认配置可能未启用 bundler，这里显式指定
-          npx tauri build --bundles nsis --target x86_64-pc-windows-msvc
-          
-          Write-Host "✅ Build completed"
+      - name: 🏗️ Build Windows Application
+        run: npm run app-build
         env:
           YAAK_TARGET_ARCH: x64
-          # 如果需要代码签名，取消以下注释并配置 secrets
-          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
       - name: 🔍 Debug Build Output
         shell: pwsh
         run: |
           Write-Host "=== Build Output Analysis ==="
           
-          # 检查实际输出位置
-          $paths = @(
+          # 检查所有可能的输出路径
+          $possiblePaths = @(
             "target/release",
+            "target/x86_64-pc-windows-msvc/release",
             "target/release/bundle",
+            "target/x86_64-pc-windows-msvc/release/bundle",
             "target/release/bundle/nsis",
-            "target/release/bundle/msi"
+            "target/x86_64-pc-windows-msvc/release/bundle/nsis"
           )
           
-          foreach ($path in $paths) {
+          foreach ($path in $possiblePaths) {
             if (Test-Path $path) {
               Write-Host "✅ EXISTS: $path"
               Get-ChildItem -Path $path -File -ErrorAction SilentlyContinue | 
                 Where-Object { $_.Extension -in @('.exe', '.msi') } |
-                ForEach-Object { Write-Host "    - $($_.Name)" }
+                ForEach-Object { 
+                  $size = [math]::Round($_.Length / 1MB, 2)
+                  Write-Host "    - $($_.Name) (${size}MB)"
+                }
             } else {
               Write-Host "❌ NOT EXISTS: $path"
             }
@@ -154,57 +148,81 @@ jobs:
         run: |
           mkdir artifacts -ErrorAction SilentlyContinue
           
-          # ✅ 正确路径：项目根目录的 target/ (Tauri v2 工作空间)
-          $bundlePath = "target/release/bundle"
-          $exePath = "target/release"
           $version = "${{ steps.version.outputs.version }}"
-          
-          Write-Host "Collecting artifacts for version: $version"
           $foundCount = 0
           
-          # 1. 复制 NSIS 安装包（包含 WebView2 安装逻辑）
-          $nsisPath = "$bundlePath/nsis"
+          # ✅ 关键修复：检查两种可能的 bundle 路径
+          $bundlePaths = @(
+            "target/x86_64-pc-windows-msvc/release/bundle",
+            "target/release/bundle"
+          )
+          
+          $actualBundlePath = $null
+          foreach ($path in $bundlePaths) {
+            if (Test-Path $path) {
+              $actualBundlePath = $path
+              Write-Host "✅ Found bundle at: $path"
+              break
+            }
+          }
+          
+          if (-not $actualBundlePath) {
+            Write-Host "::error::No bundle directory found!"
+            exit 1
+          }
+          
+          # 复制 NSIS 安装包
+          $nsisPath = "$actualBundlePath/nsis"
           if (Test-Path $nsisPath) {
             Write-Host "`n📦 Found NSIS bundle at $nsisPath"
             Get-ChildItem -Path "$nsisPath/*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
               $newName = $_.Name -replace '\.exe$', "-$version.exe"
               Copy-Item -Path $_.FullName -Destination "artifacts/$newName" -Force
-              Write-Host "  ✅ Copied NSIS installer: $newName"
+              Write-Host "  ✅ Copied NSIS: $newName"
               $foundCount++
             }
-          } else {
-            Write-Host "::warning::NSIS bundle not found at $nsisPath"
           }
           
-          # 2. 复制 MSI 安装包（如果有）
-          $msiPath = "$bundlePath/msi"
+          # 复制 MSI 安装包
+          $msiPath = "$actualBundlePath/msi"
           if (Test-Path $msiPath) {
             Write-Host "`n📦 Found MSI bundle at $msiPath"
             Get-ChildItem -Path "$msiPath/*.msi" -ErrorAction SilentlyContinue | ForEach-Object {
               $newName = $_.Name -replace '\.msi$', "-$version.msi"
               Copy-Item -Path $_.FullName -Destination "artifacts/$newName" -Force
-              Write-Host "  ✅ Copied MSI installer: $newName"
+              Write-Host "  ✅ Copied MSI: $newName"
               $foundCount++
             }
           }
           
-          # 3. 复制独立可执行文件作为备用
-          if (Test-Path "$exePath/yaak-app.exe") {
-            Write-Host "`n📦 Found portable executable"
-            Copy-Item -Path "$exePath/yaak-app.exe" -Destination "artifacts/yaak-portable-$version.exe" -Force
-            Write-Host "  ✅ Copied portable: yaak-portable-$version.exe"
-            $foundCount++
+          # 复制独立可执行文件
+          $exePaths = @(
+            "target/x86_64-pc-windows-msvc/release/yaak-app.exe",
+            "target/release/yaak-app.exe"
+          )
+          
+          foreach ($exePath in $exePaths) {
+            if (Test-Path $exePath) {
+              Write-Host "`n📦 Found portable executable at $exePath"
+              Copy-Item -Path $exePath -Destination "artifacts/yaak-portable-$version.exe" -Force
+              Write-Host "  ✅ Copied portable: yaak-portable-$version.exe"
+              $foundCount++
+              break
+            }
           }
           
-          # 4. 验证产物
+          # 验证产物
           Write-Host "`n=== Artifact Summary ==="
           $actualCount = (Get-ChildItem -Path artifacts -File -ErrorAction SilentlyContinue).Count
           
           if ($actualCount -eq 0) {
             Write-Host "::error::No build artifacts found!"
-            Write-Host "Available files in target/release/bundle:"
-            if (Test-Path "$bundlePath") {
-              Get-ChildItem -Path $bundlePath -Recurse -File | Select-Object FullName
+            Write-Host "Searched paths:"
+            foreach ($path in $bundlePaths) {
+              if (Test-Path $path) {
+                Write-Host "  Contents of $path :"
+                Get-ChildItem -Path $path -Recurse | Select-Object FullName
+              }
             }
             exit 1
           }
@@ -244,17 +262,9 @@ jobs:
             ### 🔧 Build Info
             - **Commit**: ${{ github.sha }}
             - **Build Time**: ${{ github.event.head_commit.timestamp || github.event.created_at }}
-            - **Runner**: Windows x64
             
             ### ⚠️ License
             Self-compiled version without commercial restrictions (MIT License).
-            For official builds: https://yaak.app
-            
-            ### 📝 First Run Notes
-            1. NSIS installer will auto-install WebView2 if needed
-            2. First launch may take 10-30 seconds for initialization
-            3. If portable version fails to start, install WebView2 manually:
-               https://developer.microsoft.com/en-us/microsoft-edge/webview2/
           draft: false
           prerelease: ${{ contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
           generate_release_notes: true
