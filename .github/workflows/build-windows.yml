@@ -65,21 +65,21 @@ jobs:
           echo "Using version: $VERSION"
         shell: pwsh
 
-      # 使用项目自带的 replace-version 脚本更新所有版本文件（package.json、tauri.conf.json 等）
+      # 使用项目自带的 replace-version 脚本更新版本
       - name: Set version
         run: npm run replace-version
         env:
           YAAK_VERSION: ${{ env.VERSION }}
 
-      # 构建（不创建 GitHub Release）
+      # 构建（禁用签名）
       - uses: tauri-apps/tauri-action@v0
         env:
           YAAK_TARGET_ARCH: "x64"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # 不设置任何签名相关的环境变量
         with:
-          # 使用正确的配置文件路径（注意：crates-tauri/yaak-app/tauri.release.conf.json）
-          args: "--config ./crates-tauri/yaak-app/tauri.release.conf.json"
+          # 使用主配置文件，并覆盖签名命令为空（禁用签名）
+          args: "--config ./crates-tauri/yaak-app/tauri.release.conf.json --config '{\"bundle\": {\"windows\": {\"signingCommand\": null}}}'"
 
       # 上传生成的 NSIS 安装包作为工作流产物
       - name: Upload NSIS installer
