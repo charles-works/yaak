@@ -42,7 +42,6 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          # 获取 tag 或 commit 信息
           $tag = git describe --tags --exact-match 2>$null
           if (-not $tag) {
             $tag = git describe --tags --abbrev=0 2>$null
@@ -50,8 +49,6 @@ jobs:
           if (-not $tag) {
             $tag = "dev-$(git rev-parse --short HEAD)"
           }
-          
-          # 清理 tag 格式 (移除 v 前缀)
           $version = $tag -replace '^v', ''
           
           Write-Host "Tag: $tag"
@@ -82,7 +79,6 @@ jobs:
       - name: 🔧 Install Windows Build Dependencies
         shell: pwsh
         run: |
-          # Install WebView2 Runtime (required for Tauri v2)
           Write-Host "Installing WebView2 Runtime..."
           $webview2Url = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
           $installer = "$env:TEMP\MicrosoftEdgeWebview2Setup.exe"
@@ -90,7 +86,6 @@ jobs:
           Start-Process -FilePath $installer -ArgumentList '/silent', '/install' -Wait
           Write-Host "✅ WebView2 installed"
           
-          # Install protoc for plugin system
           Write-Host "Installing protoc..."
           choco install protoc -y --no-progress
           Write-Host "✅ protoc installed"
@@ -107,36 +102,36 @@ jobs:
         run: npm run app-build
         env:
           YAAK_TARGET_ARCH: x64
-          # 不使用官方 release 配置，避免许可证检查
-          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
 
       - name: 🔍 Debug Build Output
         shell: pwsh
         run: |
-          Write-Host "=== Searching for build outputs ==="
+          Write-Host "=== Build Output Analysis ==="
           
-          # 列出 target/release 目录内容
-          if (Test-Path "target/release") {
-            Write-Host "`n📁 target/release contents:"
-            Get-ChildItem -Path "target/release" -File | 
-              Where-Object { $_.Extension -in @('.exe', '.dll', '.pdb') } |
-              Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} |
-              Format-Table -AutoSize
-          }
+          # 检查实际输出位置
+          $paths = @(
+            "target/release",
+            "target/release/bundle",
+            "src-tauri/target/release",
+            "src-tauri/target/release/bundle"
+          )
           
-          # 列出 bundle 目录内容
-          if (Test-Path "target/release/bundle") {
-            Write-Host "`n📁 target/release/bundle contents:"
-            Get-ChildItem -Path "target/release/bundle" -Recurse -File |
-              Select-Object FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} |
-              Format-Table -AutoSize
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Write-Host "✅ EXISTS: $path"
+              Get-ChildItem -Path $path -File -ErrorAction SilentlyContinue | 
+                Where-Object { $_.Extension -in @('.exe', '.msi') } |
+                ForEach-Object { Write-Host "    - $($_.Name)" }
+            } else {
+              Write-Host "❌ NOT EXISTS: $path"
+            }
           }
           
           # 搜索所有 exe 文件
-          Write-Host "`n🔍 Searching for all .exe files:"
+          Write-Host "`n=== All EXE Files ==="
           Get-ChildItem -Path "target" -Recurse -Include "*.exe" -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch "target\\release\\build" } |
-            Select-Object -First 10 FullName |
+            Where-Object { $_.FullName -notmatch "target\\release\\build" -and $_.Length -gt 1MB } |
+            Select-Object -First 10 FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} |
             Format-Table -AutoSize
 
       - name: 📦 Collect Build Artifacts
@@ -155,7 +150,7 @@ jobs:
           
           $foundCount = 0
           
-          # 复制 NSIS 安装包
+          # 1. 复制 NSIS 安装包
           if (Test-Path "$bundlePath/nsis") {
             Write-Host "`n📦 Found NSIS bundle"
             Get-ChildItem -Path "$bundlePath/nsis/*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -168,7 +163,7 @@ jobs:
             Write-Host "  ⚠️ NSIS bundle not found at $bundlePath/nsis"
           }
           
-          # 复制 MSI 安装包
+          # 2. 复制 MSI 安装包
           if (Test-Path "$bundlePath/msi") {
             Write-Host "`n📦 Found MSI bundle"
             Get-ChildItem -Path "$bundlePath/msi/*.msi" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -181,7 +176,7 @@ jobs:
             Write-Host "  ⚠️ MSI bundle not found at $bundlePath/msi"
           }
           
-          # 复制独立可执行文件 (根据日志：yaak-app.exe)
+          # 3. 复制独立可执行文件 (根据日志：yaak-app.exe)
           if (Test-Path "$exePath/yaak-app.exe") {
             Write-Host "`n📦 Found portable executable"
             Copy-Item -Path "$exePath/yaak-app.exe" -Destination "artifacts/yaak-portable-$version.exe" -Force
@@ -202,7 +197,7 @@ jobs:
             }
           }
           
-          # 复制必要的 DLL 文件 (与 yaak 相关的)
+          # 4. 复制必要的 DLL 文件
           Get-ChildItem -Path "$exePath/*.dll" -ErrorAction SilentlyContinue | 
             Where-Object { $_.Name -like "*yaak*" -or $_.Name -like "*tauri*" } |
             ForEach-Object {
@@ -211,16 +206,20 @@ jobs:
               $foundCount++
             }
           
-          # 验证产物
+          # 5. 验证产物（关键修复！）
           Write-Host "`n=== Artifact Summary ==="
-          if ($foundCount -eq 0) {
-            Write-Host "::error::No build artifacts found!"
+          $actualCount = (Get-ChildItem -Path artifacts -File -ErrorAction SilentlyContinue).Count
+          
+          if ($actualCount -eq 0) {
+            Write-Host "::error::No build artifacts found in artifacts directory!"
             Write-Host "Available files in target/release:"
-            Get-ChildItem -Path "target/release" -File | Select-Object Name
+            Get-ChildItem -Path "target/release" -File -ErrorAction SilentlyContinue | 
+              Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} |
+              Format-Table -AutoSize
             exit 1
           }
           
-          Write-Host "✅ Total artifacts collected: $foundCount"
+          Write-Host "✅ Total artifacts collected: $actualCount"
           Write-Host "`n📦 Build Artifacts:"
           Get-ChildItem -Path artifacts -File | ForEach-Object {
             $size = [math]::Round($_.Length / 1MB, 2)
@@ -249,26 +248,16 @@ jobs:
             
             | Type | File | Description |
             |------|------|-------------|
-            | **NSIS Installer** | `Yaak_*_${{ steps.version.outputs.version }}_x64-setup.exe` | Recommended for most users |
-            | **MSI Installer** | `Yaak_*_${{ steps.version.outputs.version }}_x64_en-US.msi` | For enterprise deployment |
-            | **Portable** | `yaak-portable-${{ steps.version.outputs.version }}.exe` | No installation required |
+            | **NSIS Installer** | `Yaak_*_${{ steps.version.outputs.version }}_x64-setup.exe` | Recommended |
+            | **MSI Installer** | `Yaak_*_${{ steps.version.outputs.version }}_x64_en-US.msi` | Enterprise |
+            | **Portable** | `yaak-portable-${{ steps.version.outputs.version }}.exe` | No install |
             
             ### 🔧 Build Info
             - **Commit**: ${{ github.sha }}
             - **Build Time**: ${{ github.event.head_commit.timestamp || github.event.created_at }}
-            - **Runner**: ${{ runner.os }} ${{ runner.arch }}
             
-            ### ⚠️ License Notice
-            This is a self-compiled version without commercial restrictions.
-            For official builds and support, please visit: https://yaak.app
-            
-            ### 📝 Usage Notes
-            1. **First launch** may take 10-30 seconds for initialization
-            2. **WebView2** is required (auto-installed by NSIS/MSI)
-            3. **Portable version** requires WebView2 to be pre-installed
-            
-            ---
-            *Built with ❤️ using GitHub Actions*
+            ### ⚠️ License
+            Self-compiled version without commercial restrictions.
           draft: false
           prerelease: ${{ contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
           generate_release_notes: true
@@ -286,8 +275,6 @@ jobs:
           Write-Host "🔗 Commit: ${{ github.sha }}"
           
           if ("${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true") {
-            Write-Host "🚀 Release created: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
-          } else {
-            Write-Host "📥 Download artifacts from the Actions tab"
+            Write-Host "🚀 Release: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
           }
           Write-Host "========================================"
