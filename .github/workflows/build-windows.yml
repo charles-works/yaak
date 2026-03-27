@@ -90,10 +90,24 @@ jobs:
           choco install protoc -y --no-progress
           Write-Host "✅ protoc installed"
 
-          # 修复：安装 NSIS，Tauri 在 Windows 上打包必需
           Write-Host "Installing NSIS..."
           choco install nsis -y --no-progress
           Write-Host "✅ NSIS installed"
+
+          # 关键修复：将 NSIS 添加到 PATH，确保 Tauri 能找到 makensis
+          $nsisPath = "C:\Program Files (x86)\NSIS"
+          if (Test-Path $nsisPath) {
+            Write-Host "Adding $nsisPath to PATH"
+            $env:PATH = "$nsisPath;$env:PATH"
+            echo "NSIS_PATH=$nsisPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+            echo "PATH=$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            Write-Host "⚠️ NSIS not found at default path!"
+          }
+          
+          # 验证 NSIS 可用性
+          Write-Host "Checking makensis location:"
+          where.exe makensis
 
       - name: 📥 Install NPM Dependencies
         run: npm ci
@@ -103,10 +117,22 @@ jobs:
         env:
           YAAK_TARGET_ARCH: x64
 
+      - name: 🔍 Debug Tauri Configuration
+        shell: pwsh
+        run: |
+          Write-Host "=== Tauri Config ==="
+          Get-Content crates-tauri/yaak-app/tauri.conf.json
+          Write-Host "=== Tauri Bundler Config ==="
+          if (Test-Path crates-tauri/yaak-app/tauri.conf.json) {
+            (Get-Content crates-tauri/yaak-app/tauri.conf.json | ConvertFrom-Json).tauri.bundle | ConvertTo-Json -Depth 10
+          }
+
       - name: 🏗️ Build Windows Application
         run: npm run app-build
         env:
           YAAK_TARGET_ARCH: x64
+          RUST_LOG: info  # 增加 Rust 日志详细程度
+          CARGO_TERM_VERBOSE: true  # Cargo 详细输出
 
       - name: 🔍 Debug Build Output
         shell: pwsh
@@ -156,7 +182,7 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $foundCount = 0
           
-          # ✅ 关键修复：检查两种可能的 bundle 路径
+          # 检查两种可能的 bundle 路径
           $bundlePaths = @(
             "target/x86_64-pc-windows-msvc/release/bundle",
             "target/release/bundle"
@@ -173,6 +199,15 @@ jobs:
           
           if (-not $actualBundlePath) {
             Write-Host "::error::No bundle directory found!"
+            Write-Host "Searched paths:"
+            foreach ($path in $bundlePaths) {
+              if (Test-Path $path) {
+                Write-Host "  Contents of $path :"
+                Get-ChildItem -Path $path -Recurse | Select-Object FullName
+              } else {
+                Write-Host "  $path does not exist"
+              }
+            }
             exit 1
           }
           
@@ -222,13 +257,6 @@ jobs:
           
           if ($actualCount -eq 0) {
             Write-Host "::error::No build artifacts found!"
-            Write-Host "Searched paths:"
-            foreach ($path in $bundlePaths) {
-              if (Test-Path $path) {
-                Write-Host "  Contents of $path :"
-                Get-ChildItem -Path $path -Recurse | Select-Object FullName
-              }
-            }
             exit 1
           }
           
