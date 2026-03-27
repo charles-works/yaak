@@ -67,43 +67,49 @@ jobs:
         run: npm run app-build
         env:
           YAAK_TARGET_ARCH: x64
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          # 如果需要代码签名，添加以下环境变量
-          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
       - name: 📦 Collect Build Artifacts
         run: |
           mkdir artifacts
           
-          # Tauri 默认输出路径
-          $bundlePath = "src-tauri/target/release/bundle"
+          # ✅ 正确路径：项目根目录的 target/ (Tauri v2 工作空间)
+          $bundlePath = "target/release/bundle"
+          $exePath = "target/release"
           
-          if (Test-Path $bundlePath) {
-            Write-Host "Bundle path exists: $bundlePath"
-            
-            # 复制 NSIS 安装包
-            if (Test-Path "$bundlePath/nsis") {
-              Copy-Item -Path "$bundlePath/nsis/*.exe" -Destination "artifacts/" -Force
-              Write-Host "✅ Copied NSIS installers"
-            }
-            
-            # 复制 MSI 安装包
-            if (Test-Path "$bundlePath/msi") {
-              Copy-Item -Path "$bundlePath/msi/*.msi" -Destination "artifacts/" -Force
-              Write-Host "✅ Copied MSI installers"
-            }
-            
-            # 复制 deb（如果有）
-            if (Test-Path "$bundlePath/deb") {
-              Copy-Item -Path "$bundlePath/deb/*.deb" -Destination "artifacts/" -Force
-              Write-Host "✅ Copied DEB packages"
-            }
+          Write-Host "Searching for build outputs..."
+          
+          # 列出所有可能的构建产物
+          Get-ChildItem -Path "target/release" -ErrorAction SilentlyContinue | 
+            Where-Object { $_.Name -match "\.(exe|msi|nsis)" } |
+            ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          
+          # 复制 NSIS 安装包
+          if (Test-Path "$bundlePath/nsis") {
+            Copy-Item -Path "$bundlePath/nsis/*.exe" -Destination "artifacts/" -Force
+            Write-Host "✅ Copied NSIS installers"
           }
           
-          # 复制独立的 exe 文件
-          if (Test-Path "src-tauri/target/release/yaak.exe") {
-            Copy-Item -Path "src-tauri/target/release/yaak.exe" -Destination "artifacts/yaak-portable.exe" -Force
-            Write-Host "✅ Copied portable executable"
+          # 复制 MSI 安装包
+          if (Test-Path "$bundlePath/msi") {
+            Copy-Item -Path "$bundlePath/msi/*.msi" -Destination "artifacts/" -Force
+            Write-Host "✅ Copied MSI installers"
+          }
+          
+          # 复制独立可执行文件 (根据日志，实际名称是 yaak-app.exe)
+          if (Test-Path "$exePath/yaak-app.exe") {
+            Copy-Item -Path "$exePath/yaak-app.exe" -Destination "artifacts/yaak-portable.exe" -Force
+            Write-Host "✅ Copied portable executable (yaak-app.exe)"
+          }
+          
+          # 如果找不到，搜索整个 target 目录
+          if ((Get-ChildItem -Path artifacts -ErrorAction SilentlyContinue).Count -eq 0) {
+            Write-Host "::warning::No artifacts found in expected paths, searching..."
+            Get-ChildItem -Path "target" -Recurse -Include "*.exe","*.msi" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch "target\\release\\build" } |
+              ForEach-Object {
+                Write-Host "Found: $($_.FullName)"
+                Copy-Item -Path $_.FullName -Destination "artifacts/" -Force
+              }
           }
           
           # 显示所有产物
@@ -119,7 +125,7 @@ jobs:
           name: yaak-windows-x64
           path: artifacts/*
           retention-days: 7
-          if-no-files-found: error  # 改为 error 以便发现问题
+          if-no-files-found: error
 
       - name: ✅ Build Complete
         run: |
