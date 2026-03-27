@@ -1,7 +1,7 @@
 name: Build Yaak for Windows
 
 on:
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -9,7 +9,6 @@ on:
       - 'src-web/**'
       - 'packages/**'
       - 'package.json'
-      - '.github/workflows/build-windows.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 🟢 Setup Node.js (v24+)
+      - name: 🟢 Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -47,14 +46,13 @@ jobs:
 
       - name: 🔧 Install Windows Build Dependencies
         run: |
-          # Install WebView2 runtime (required for Tauri)
-          Write-Host "Installing WebView2..."
+          # Install WebView2
           $webview2Url = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
           $installer = "$env:TEMP\MicrosoftEdgeWebview2Setup.exe"
           Invoke-WebRequest -Uri $webview2Url -OutFile $installer
           Start-Process -FilePath $installer -ArgumentList '/silent', '/install' -Wait
           
-          # Install protoc for plugin system
+          # Install protoc
           choco install protoc -y --no-progress
 
       - name: 📥 Install NPM Dependencies
@@ -65,45 +63,65 @@ jobs:
         env:
           YAAK_TARGET_ARCH: x64
 
-      - name: 🧪 Run Tests (Optional)
-        run: |
-          npm run lint
-          # Skip JS/Rust tests to save time if not needed
-          # vp test
-          # cargo test --all --exclude yaak-cli
-
       - name: 🏗️ Build Windows Application
         run: npm run app-build
         env:
           YAAK_TARGET_ARCH: x64
-          # ⚠️ 关键：不使用 release 配置，避免包含许可证检查
-          # 官方: --config ./crates-tauri/yaak-app/tauri.release.conf.json
-          # 我们: 使用默认配置 (无商用限制)
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          # 如果需要代码签名，添加以下环境变量
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
       - name: 📦 Collect Build Artifacts
         run: |
-          # 创建输出目录
-          mkdir -p artifacts
+          mkdir artifacts
           
-          # 复制构建产物 (根据实际情况调整路径)
-          # 默认构建输出在: src-tauri/target/release/bundle/
-          Copy-Item -Path "src-tauri/target/release/bundle/nsis/*.exe" -Destination "artifacts/" -ErrorAction SilentlyContinue
-          Copy-Item -Path "src-tauri/target/release/bundle/msi/*.msi" -Destination "artifacts/" -ErrorAction SilentlyContinue
-          Copy-Item -Path "src-tauri/target/release/yaak.exe" -Destination "artifacts/" -ErrorAction SilentlyContinue
+          # Tauri 默认输出路径
+          $bundlePath = "src-tauri/target/release/bundle"
           
-          # 列出产物
-          Get-ChildItem -Path artifacts -Recurse
+          if (Test-Path $bundlePath) {
+            Write-Host "Bundle path exists: $bundlePath"
+            
+            # 复制 NSIS 安装包
+            if (Test-Path "$bundlePath/nsis") {
+              Copy-Item -Path "$bundlePath/nsis/*.exe" -Destination "artifacts/" -Force
+              Write-Host "✅ Copied NSIS installers"
+            }
+            
+            # 复制 MSI 安装包
+            if (Test-Path "$bundlePath/msi") {
+              Copy-Item -Path "$bundlePath/msi/*.msi" -Destination "artifacts/" -Force
+              Write-Host "✅ Copied MSI installers"
+            }
+            
+            # 复制 deb（如果有）
+            if (Test-Path "$bundlePath/deb") {
+              Copy-Item -Path "$bundlePath/deb/*.deb" -Destination "artifacts/" -Force
+              Write-Host "✅ Copied DEB packages"
+            }
+          }
+          
+          # 复制独立的 exe 文件
+          if (Test-Path "src-tauri/target/release/yaak.exe") {
+            Copy-Item -Path "src-tauri/target/release/yaak.exe" -Destination "artifacts/yaak-portable.exe" -Force
+            Write-Host "✅ Copied portable executable"
+          }
+          
+          # 显示所有产物
+          Write-Host "`n📦 Build Artifacts:"
+          Get-ChildItem -Path artifacts -Recurse | ForEach-Object {
+            $size = [math]::Round($_.Length / 1MB, 2)
+            Write-Host "  $($_.Name) - ${size}MB"
+          }
 
       - name: 📤 Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: yaak-windows-x64-build
-          path: artifacts/
+          name: yaak-windows-x64
+          path: artifacts/*
           retention-days: 7
-          if-no-files-found: warn
+          if-no-files-found: error  # 改为 error 以便发现问题
 
       - name: ✅ Build Complete
         run: |
-          Write-Host "✅ Windows build completed successfully!"
-          Write-Host "📦 Artifacts uploaded and available for download"
-          Write-Host "🔗 Check the 'Actions' tab -> This workflow -> 'Artifacts' section"
+          Write-Host "✅ Windows build completed!"
+          Write-Host "📦 Download artifacts from the Actions tab"
