@@ -3,9 +3,9 @@ name: Build Yaak for Windows x64 (Unsigned)
 on:
   push:
     branches: [main, master]
-    # 如果想在打标签时自动构建，可以取消注释下面的 tags
+    # 如需在标签推送时构建，取消下面的注释
     # tags: [v*]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build-windows-x64:
@@ -16,69 +16,79 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 配置 Vite+ 环境（包含 Node.js 24 和缓存）
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
         with:
           node-version: "24"
           cache: true
 
-      # 安装 Rust 稳定版（无需额外 target）
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      # 缓存 Rust 依赖
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
           cache-on-failure: true
 
-      # 安装 protoc（插件运行时需要）
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 安装项目依赖
       - name: Install dependencies
         run: vp install
 
-      # 引导项目（安装 workspace 依赖，编译 Rust 代码等）
       - name: Bootstrap
         run: npm run bootstrap
         env:
-          YAAK_TARGET_ARCH: "x64"   # 指定构建目标架构为 x64
+          YAAK_TARGET_ARCH: "x64"
 
-      # 可选：运行代码检查（建议保留）
       - name: Lint
         run: npm run lint
 
-      # 可选：运行测试（能提前发现错误）
       - name: Run JS Tests
         run: vp test
 
       - name: Run Rust Tests
         run: cargo test --all --exclude yaak-cli
 
-      # 设置版本号（若未打 tag，使用 commit SHA 作为版本标识）
-      - name: Set version
-        run: npm run replace-version
-        env:
-          YAAK_VERSION: ${{ github.ref_name == '' && format('0.0.0-{0}', github.sha) || github.ref_name }}
+      # ---------- 版本号处理 ----------
+      # 根据触发方式生成有效的 semver 版本号
+      - name: Determine version
+        id: version
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v\d') {
+            # 标签以 v 开头，去掉 v 前缀
+            $VERSION = $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            # 非标签构建：使用 0.0.0-<短提交哈希>
+            $SHORT_SHA = $env:GITHUB_SHA.Substring(0, 7)
+            $VERSION = "0.0.0-$SHORT_SHA"
+          }
+          echo "VERSION=$VERSION" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "Using version: $VERSION"
+        shell: pwsh
 
-      # 构建 Tauri 应用（不创建 GitHub Release，仅生成安装包）
+      # 直接修改 Tauri 配置文件中的版本号（不依赖可能失效的 replace-version 脚本）
+      - name: Set version in config
+        run: |
+          $configPath = "crates-tauri/yaak-app/tauri.release.conf.json"
+          $json = Get-Content $configPath -Raw | ConvertFrom-Json
+          $json.package.version = $env:VERSION
+          $json | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding utf8
+        shell: pwsh
+
+      # 构建（不创建 GitHub Release）
       - uses: tauri-apps/tauri-action@v0
         env:
           YAAK_TARGET_ARCH: "x64"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 以下签名相关环境变量全部省略，避免触发商用签名
+          # 不设置任何签名相关环境变量
         with:
-          # 不发布到 Release，只构建
-          release: false
-          # 使用官方提供的发布配置文件
+          # 不指定 releaseId/tagName 等，避免自动发布 Release
           args: "--config ./crates-tauri/yaak-app/tauri.release.conf.json"
 
-      # 上传生成的安装程序作为工作流产物（NSIS 安装包）
+      # 上传安装包作为工作流产物
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
         with:
