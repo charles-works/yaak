@@ -90,6 +90,11 @@ jobs:
           choco install protoc -y --no-progress
           Write-Host "✅ protoc installed"
 
+          # 修复：安装 NSIS，Tauri 在 Windows 上打包必需
+          Write-Host "Installing NSIS..."
+          choco install nsis -y --no-progress
+          Write-Host "✅ NSIS installed"
+
       - name: 📥 Install NPM Dependencies
         run: npm ci
 
