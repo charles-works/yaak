@@ -1,30 +1,65 @@
+# .github/workflows/build-windows.yml
 name: Build Yaak for Windows
 
 on:
   workflow_dispatch:
+    inputs:
+      build_tag:
+        description: 'Tag to build (leave empty for latest commit)'
+        required: false
+        type: string
   push:
     branches: [main]
+    tags:
+      - 'v*'
     paths:
       - 'crates-tauri/**'
       - 'src-web/**'
       - 'packages/**'
       - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/build-windows.yml'
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build-windows:
     name: Build Windows x64
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     
     steps:
       - name: 📦 Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.build_tag || github.ref }}
+
+      - name: 🏷️ Get Version Info
+        id: version
+        shell: pwsh
+        run: |
+          # 获取 tag 或 commit 信息
+          $tag = git describe --tags --exact-match 2>$null
+          if (-not $tag) {
+            $tag = git describe --tags --abbrev=0 2>$null
+          }
+          if (-not $tag) {
+            $tag = "dev-$(git rev-parse --short HEAD)"
+          }
+          
+          # 清理 tag 格式 (移除 v 前缀)
+          $version = $tag -replace '^v', ''
+          
+          Write-Host "Tag: $tag"
+          Write-Host "Version: $version"
+          
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "artifact_name=yaak-windows-x64-$version" >> $env:GITHUB_OUTPUT
 
       - name: 🟢 Setup Node.js
         uses: actions/setup-node@v4
@@ -45,15 +80,20 @@ jobs:
           cache-on-failure: true
 
       - name: 🔧 Install Windows Build Dependencies
+        shell: pwsh
         run: |
-          # Install WebView2
+          # Install WebView2 Runtime (required for Tauri v2)
+          Write-Host "Installing WebView2 Runtime..."
           $webview2Url = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
           $installer = "$env:TEMP\MicrosoftEdgeWebview2Setup.exe"
           Invoke-WebRequest -Uri $webview2Url -OutFile $installer
           Start-Process -FilePath $installer -ArgumentList '/silent', '/install' -Wait
+          Write-Host "✅ WebView2 installed"
           
-          # Install protoc
+          # Install protoc for plugin system
+          Write-Host "Installing protoc..."
           choco install protoc -y --no-progress
+          Write-Host "✅ protoc installed"
 
       - name: 📥 Install NPM Dependencies
         run: npm ci
@@ -67,54 +107,122 @@ jobs:
         run: npm run app-build
         env:
           YAAK_TARGET_ARCH: x64
+          # 不使用官方 release 配置，避免许可证检查
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+
+      - name: 🔍 Debug Build Output
+        shell: pwsh
+        run: |
+          Write-Host "=== Searching for build outputs ==="
+          
+          # 列出 target/release 目录内容
+          if (Test-Path "target/release") {
+            Write-Host "`n📁 target/release contents:"
+            Get-ChildItem -Path "target/release" -File | 
+              Where-Object { $_.Extension -in @('.exe', '.dll', '.pdb') } |
+              Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} |
+              Format-Table -AutoSize
+          }
+          
+          # 列出 bundle 目录内容
+          if (Test-Path "target/release/bundle") {
+            Write-Host "`n📁 target/release/bundle contents:"
+            Get-ChildItem -Path "target/release/bundle" -Recurse -File |
+              Select-Object FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}} |
+              Format-Table -AutoSize
+          }
+          
+          # 搜索所有 exe 文件
+          Write-Host "`n🔍 Searching for all .exe files:"
+          Get-ChildItem -Path "target" -Recurse -Include "*.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "target\\release\\build" } |
+            Select-Object -First 10 FullName |
+            Format-Table -AutoSize
 
       - name: 📦 Collect Build Artifacts
+        shell: pwsh
         run: |
-          mkdir artifacts
+          mkdir artifacts -ErrorAction SilentlyContinue
           
           # ✅ 正确路径：项目根目录的 target/ (Tauri v2 工作空间)
           $bundlePath = "target/release/bundle"
           $exePath = "target/release"
+          $version = "${{ steps.version.outputs.version }}"
           
-          Write-Host "Searching for build outputs..."
+          Write-Host "Collecting artifacts for version: $version"
+          Write-Host "Bundle path: $bundlePath"
+          Write-Host "Exe path: $exePath"
           
-          # 列出所有可能的构建产物
-          Get-ChildItem -Path "target/release" -ErrorAction SilentlyContinue | 
-            Where-Object { $_.Name -match "\.(exe|msi|nsis)" } |
-            ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          $foundCount = 0
           
           # 复制 NSIS 安装包
           if (Test-Path "$bundlePath/nsis") {
-            Copy-Item -Path "$bundlePath/nsis/*.exe" -Destination "artifacts/" -Force
-            Write-Host "✅ Copied NSIS installers"
+            Write-Host "`n📦 Found NSIS bundle"
+            Get-ChildItem -Path "$bundlePath/nsis/*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+              $newName = $_.Name -replace '\.exe$', "-$version.exe"
+              Copy-Item -Path $_.FullName -Destination "artifacts/$newName" -Force
+              Write-Host "  ✅ Copied NSIS: $newName"
+              $foundCount++
+            }
+          } else {
+            Write-Host "  ⚠️ NSIS bundle not found at $bundlePath/nsis"
           }
           
           # 复制 MSI 安装包
           if (Test-Path "$bundlePath/msi") {
-            Copy-Item -Path "$bundlePath/msi/*.msi" -Destination "artifacts/" -Force
-            Write-Host "✅ Copied MSI installers"
+            Write-Host "`n📦 Found MSI bundle"
+            Get-ChildItem -Path "$bundlePath/msi/*.msi" -ErrorAction SilentlyContinue | ForEach-Object {
+              $newName = $_.Name -replace '\.msi$', "-$version.msi"
+              Copy-Item -Path $_.FullName -Destination "artifacts/$newName" -Force
+              Write-Host "  ✅ Copied MSI: $newName"
+              $foundCount++
+            }
+          } else {
+            Write-Host "  ⚠️ MSI bundle not found at $bundlePath/msi"
           }
           
-          # 复制独立可执行文件 (根据日志，实际名称是 yaak-app.exe)
+          # 复制独立可执行文件 (根据日志：yaak-app.exe)
           if (Test-Path "$exePath/yaak-app.exe") {
-            Copy-Item -Path "$exePath/yaak-app.exe" -Destination "artifacts/yaak-portable.exe" -Force
-            Write-Host "✅ Copied portable executable (yaak-app.exe)"
-          }
-          
-          # 如果找不到，搜索整个 target 目录
-          if ((Get-ChildItem -Path artifacts -ErrorAction SilentlyContinue).Count -eq 0) {
-            Write-Host "::warning::No artifacts found in expected paths, searching..."
-            Get-ChildItem -Path "target" -Recurse -Include "*.exe","*.msi" -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -notmatch "target\\release\\build" } |
-              ForEach-Object {
-                Write-Host "Found: $($_.FullName)"
-                Copy-Item -Path $_.FullName -Destination "artifacts/" -Force
+            Write-Host "`n📦 Found portable executable"
+            Copy-Item -Path "$exePath/yaak-app.exe" -Destination "artifacts/yaak-portable-$version.exe" -Force
+            Write-Host "  ✅ Copied portable: yaak-portable-$version.exe"
+            $foundCount++
+          } else {
+            Write-Host "  ⚠️ yaak-app.exe not found at $exePath/yaak-app.exe"
+            
+            # 尝试查找其他可能的 exe 名称
+            $alternatives = @("yaak.exe", "Yaak.exe", "app.exe")
+            foreach ($alt in $alternatives) {
+              if (Test-Path "$exePath/$alt") {
+                Copy-Item -Path "$exePath/$alt" -Destination "artifacts/yaak-portable-$version.exe" -Force
+                Write-Host "  ✅ Copied alternative: $alt"
+                $foundCount++
+                break
               }
+            }
           }
           
-          # 显示所有产物
+          # 复制必要的 DLL 文件 (与 yaak 相关的)
+          Get-ChildItem -Path "$exePath/*.dll" -ErrorAction SilentlyContinue | 
+            Where-Object { $_.Name -like "*yaak*" -or $_.Name -like "*tauri*" } |
+            ForEach-Object {
+              Copy-Item -Path $_.FullName -Destination "artifacts/" -Force
+              Write-Host "  ✅ Copied DLL: $($_.Name)"
+              $foundCount++
+            }
+          
+          # 验证产物
+          Write-Host "`n=== Artifact Summary ==="
+          if ($foundCount -eq 0) {
+            Write-Host "::error::No build artifacts found!"
+            Write-Host "Available files in target/release:"
+            Get-ChildItem -Path "target/release" -File | Select-Object Name
+            exit 1
+          }
+          
+          Write-Host "✅ Total artifacts collected: $foundCount"
           Write-Host "`n📦 Build Artifacts:"
-          Get-ChildItem -Path artifacts -Recurse | ForEach-Object {
+          Get-ChildItem -Path artifacts -File | ForEach-Object {
             $size = [math]::Round($_.Length / 1MB, 2)
             Write-Host "  $($_.Name) - ${size}MB"
           }
@@ -122,12 +230,64 @@ jobs:
       - name: 📤 Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: yaak-windows-x64
+          name: ${{ steps.version.outputs.artifact_name }}
           path: artifacts/*
-          retention-days: 7
+          retention-days: 14
           if-no-files-found: error
+          compression-level: 6
+
+      - name: 🚀 Create GitHub Release (Tag Only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          name: Yaak ${{ steps.version.outputs.version }}
+          body: |
+            ## Yaak ${{ steps.version.outputs.version }}
+            
+            ### 📦 Downloads
+            
+            | Type | File | Description |
+            |------|------|-------------|
+            | **NSIS Installer** | `Yaak_*_${{ steps.version.outputs.version }}_x64-setup.exe` | Recommended for most users |
+            | **MSI Installer** | `Yaak_*_${{ steps.version.outputs.version }}_x64_en-US.msi` | For enterprise deployment |
+            | **Portable** | `yaak-portable-${{ steps.version.outputs.version }}.exe` | No installation required |
+            
+            ### 🔧 Build Info
+            - **Commit**: ${{ github.sha }}
+            - **Build Time**: ${{ github.event.head_commit.timestamp || github.event.created_at }}
+            - **Runner**: ${{ runner.os }} ${{ runner.arch }}
+            
+            ### ⚠️ License Notice
+            This is a self-compiled version without commercial restrictions.
+            For official builds and support, please visit: https://yaak.app
+            
+            ### 📝 Usage Notes
+            1. **First launch** may take 10-30 seconds for initialization
+            2. **WebView2** is required (auto-installed by NSIS/MSI)
+            3. **Portable version** requires WebView2 to be pre-installed
+            
+            ---
+            *Built with ❤️ using GitHub Actions*
+          draft: false
+          prerelease: ${{ contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: ✅ Build Complete
+        shell: pwsh
         run: |
-          Write-Host "✅ Windows build completed!"
-          Write-Host "📦 Download artifacts from the Actions tab"
+          Write-Host "========================================"
+          Write-Host "✅ Windows build completed successfully!"
+          Write-Host "========================================"
+          Write-Host "📦 Artifact: ${{ steps.version.outputs.artifact_name }}"
+          Write-Host "🏷️ Version: ${{ steps.version.outputs.version }}"
+          Write-Host "🔗 Commit: ${{ github.sha }}"
+          
+          if ("${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true") {
+            Write-Host "🚀 Release created: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          } else {
+            Write-Host "📥 Download artifacts from the Actions tab"
+          }
+          Write-Host "========================================"
