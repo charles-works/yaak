@@ -3,7 +3,7 @@ name: Build Yaak for Windows x64 (Unsigned)
 on:
   push:
     branches: [main, master]
-    # tags: [v*]   # 按需启用
+    # tags: [v*]   # 按需启用标签构建
   workflow_dispatch:
 
 jobs:
@@ -65,34 +65,23 @@ jobs:
           echo "Using version: $VERSION"
         shell: pwsh
 
-      # 修改 Tauri 配置文件的版本号（修复路径并增强健壮性）
-      - name: Set version in config
-        run: |
-          $configPath = "crates-tauri/yaak-app/tauri.release.conf.json"
-          if (-not (Test-Path $configPath)) {
-            Write-Error "Config file not found: $configPath"
-            exit 1
-          }
-          $json = Get-Content $configPath -Raw | ConvertFrom-Json
-          # 确保 package 对象存在，若不存在则创建
-          if (-not $json.package) {
-            $json | Add-Member -NotePropertyName "package" -NotePropertyValue @{}
-          }
-          $json.package.version = $env:VERSION
-          $json | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding utf8
-          Write-Host "Updated version to $($env:VERSION) in $configPath"
-        shell: pwsh
+      # 使用项目自带的 replace-version 脚本更新所有版本文件（package.json、tauri.conf.json 等）
+      - name: Set version
+        run: npm run replace-version
+        env:
+          YAAK_VERSION: ${{ env.VERSION }}
 
       # 构建（不创建 GitHub Release）
       - uses: tauri-apps/tauri-action@v0
         env:
           YAAK_TARGET_ARCH: "x64"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 不设置任何签名相关环境变量
+          # 不设置任何签名相关的环境变量
         with:
+          # 使用正确的配置文件路径（注意：crates-tauri/yaak-app/tauri.release.conf.json）
           args: "--config ./crates-tauri/yaak-app/tauri.release.conf.json"
 
-      # 上传安装包作为工作流产物
+      # 上传生成的 NSIS 安装包作为工作流产物
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
         with:
