@@ -185,7 +185,10 @@ jobs:
           # 检查两种可能的 bundle 路径
           $bundlePaths = @(
             "target/x86_64-pc-windows-msvc/release/bundle",
-            "target/release/bundle"
+            "target/release/bundle",
+            "target/release",
+            "target/release/vendored/node",
+            "target/release/vendored/protoc"
           )
           
           $actualBundlePath = $null
