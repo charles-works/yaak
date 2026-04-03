@@ -1,6 +1,6 @@
 # .github/workflows/build-windows-free.yml
 # 构建Yaak Windows amd64免费商用版本
-# 基于Tauri v2官方推荐配置
+# 修复版：使用npm、修正路径、更新Node版本
 
 name: Build Windows Free Edition
 
@@ -13,17 +13,19 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号 (例如: 2024.1.0)'
+        description: '版本号 (例如: 2025.9.3)'
         required: false
         default: ''
 
 env:
-  # Node.js版本 - 与Yaak官方保持一致
-  NODE_VERSION: '20'
-  # Rust版本
+  # Node.js 24 (2026年6月后Node 20将被弃用)
+  NODE_VERSION: '24'
+  # Rust稳定版
   RUST_VERSION: 'stable'
   # 构建目标
   BUILD_TARGET: 'x86_64-pc-windows-msvc'
+  # 强制使用Node 24
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   build-windows:
@@ -39,7 +41,7 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # 2. 设置Node.js环境
+      # 2. 设置Node.js环境 (使用Node 24)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -47,29 +49,7 @@ jobs:
           cache: 'npm'
           cache-dependency-path: package-lock.json
 
-      # 3. 安装pnpm (Yaak使用pnpm作为包管理器)
-      - name: Install pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 9
-          run_install: false
-
-      # 4. 获取pnpm存储目录
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-      # 5. 设置pnpm缓存
-      - name: Setup pnpm cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
-      # 6. 设置Rust环境
+      # 3. 设置Rust环境
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -77,40 +57,41 @@ jobs:
           targets: ${{ env.BUILD_TARGET }}
           components: rustfmt, clippy
 
-      # 7. 设置Rust缓存
+      # 4. 安装前端依赖 (使用npm而非pnpm)
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 5. 设置Rust缓存 (在依赖安装后执行，确保目录存在)
       - name: Setup Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './src-tauri -> target'
+          workspaces: 'src-tauri'
           cache-on-failure: true
 
-      # 8. 安装Windows依赖 (WebView2运行时)
+      # 6. 安装Windows依赖 (WebView2运行时)
       - name: Install WebView2 Runtime
         shell: pwsh
         run: |
-          # 下载并安装WebView2运行时引导程序
+          # 下载并静默安装WebView2运行时
+          $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile 'MicrosoftEdgeWebview2Setup.exe'
-          .\MicrosoftEdgeWebview2Setup.exe /install
+          Start-Process -FilePath .\MicrosoftEdgeWebview2Setup.exe -ArgumentList '/install', '/silent' -Wait
 
-      # 9. 安装前端依赖
-      - name: Install frontend dependencies
-        run: pnpm install
-
-      # 10. 构建前端应用
+      # 7. 构建前端应用
       - name: Build frontend
-        run: pnpm run build
+        run: npm run build
         env:
           # 免费商用版本标识
           YAAK_LICENSE_TYPE: 'free'
           YAAK_ENABLE_TELEMETRY: 'false'
           YAAK_ENABLE_UPDATER: 'false'
 
-      # 11. 构建Tauri应用 (Windows NSIS安装包)
-      - name: Build Tauri app (NSIS installer)
+      # 8. 构建Tauri应用 (Windows NSIS安装包)
+      - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 确保使用正确的目标平台
+          # 可选：签名密钥
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
@@ -134,8 +115,7 @@ jobs:
             - 安装包: `Yaak_${{ github.ref_name }}_x64-setup.exe`
             
             ### 系统要求
-            - Windows 10 或更高版本
-            - 64位处理器
+            - Windows 10 或更高版本 (64位)
             - WebView2运行时 (安装程序会自动安装)
             
             **注意**: 这是社区构建的免费版本，基于MIT许可证开源。
@@ -144,18 +124,17 @@ jobs:
           # 仅构建NSIS安装包(支持Windows 7+)
           args: '--target ${{ env.BUILD_TARGET }} --bundles nsis'
 
-      # 12. 上传构建产物到Artifacts (便于调试)
+      # 9. 上传构建产物到Artifacts (便于调试)
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: yaak-windows-free-${{ github.sha }}
           path: |
             src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis/*.exe
-            src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/msi/*.msi
           if-no-files-found: warn
           retention-days: 7
 
-      # 13. 生成校验文件
+      # 10. 生成校验文件
       - name: Generate checksums
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
@@ -165,10 +144,11 @@ jobs:
             Get-ChildItem $installerPath -Filter *.exe | ForEach-Object {
               $hash = Get-FileHash $_.FullName -Algorithm SHA256
               "$($hash.Hash)  $($_.Name)" | Out-File -Append -FilePath "$installerPath/checksums.sha256"
+              Write-Host "SHA256: $($hash.Hash)  $($_.Name)"
             }
           }
 
-      # 14. 输出构建信息
+      # 11. 输出构建信息
       - name: Build summary
         shell: bash
         run: |
@@ -176,5 +156,7 @@ jobs:
           echo "版本: ${{ github.ref_name }}"
           echo "目标平台: Windows amd64"
           echo "构建类型: 免费商用版"
+          echo "Node版本: $(node -v)"
+          echo "Rust版本: $(rustc --version)"
           echo "输出目录:"
           ls -la src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis/ || true
