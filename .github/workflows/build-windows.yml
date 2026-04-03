@@ -1,6 +1,5 @@
 # .github/workflows/build-windows-free.yml
-# 构建Yaak Windows amd64免费商用版本
-# 修复版：移除WebView2安装（已预装）、使用npm、修正路径
+# 修复版 v2：修正路径 + wasm-pack + 分支/标签构建支持
 
 name: Build Windows Free Edition
 
@@ -16,15 +15,17 @@ on:
         description: '版本号 (例如: 2025.9.3)'
         required: false
         default: ''
+      # 🔹 新增：支持构建指定分支/标签
+      build_ref:
+        description: 'Git ref (分支/标签), 留空则使用触发源'
+        required: false
+        default: ''
+        type: string
 
 env:
-  # Node.js 24 (2026年6月后Node 20将被弃用)
   NODE_VERSION: '24'
-  # Rust稳定版
   RUST_VERSION: 'stable'
-  # 构建目标
   BUILD_TARGET: 'x86_64-pc-windows-msvc'
-  # 强制使用Node 24
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
@@ -32,16 +33,17 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
-    
+
     steps:
-      # 1. 检出代码
+      # 1. 检出代码 - 🔹 支持动态引用
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
+          ref: ${{ inputs.build_ref != '' && inputs.build_ref || github.ref }}
 
-      # 2. 设置Node.js环境
+      # 2. 设置 Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -49,7 +51,7 @@ jobs:
           cache: 'npm'
           cache-dependency-path: package-lock.json
 
-      # 3. 设置Rust环境
+      # 3. 设置 Rust
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -57,29 +59,40 @@ jobs:
           targets: ${{ env.BUILD_TARGET }}
           components: rustfmt, clippy
 
-      # 4. 安装前端依赖
-      - name: Install frontend dependencies
+      # 🔹 新增: 安装 wasm32 目标 (yaak-templates 需要)
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      # 🔹 新增: 安装 wasm-pack (修复 wasm 构建失败)
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: 'latest'
+
+      # 4. 安装依赖
+      - name: Install dependencies
         run: npm ci
 
-      # 5. 设置Rust缓存（移到依赖安装后）
+      # 5. Rust 缓存 - 🔹 修正路径: crates-tauri (非 src-tauri!)
       - name: Setup Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: 'src-tauri'
+          workspaces: 'crates-tauri'  # ✅ 关键修复: 实际路径
           cache-on-failure: true
-          
+          prefix-key: 'v0-rust'
+
+      # 6. 检查 WebView2 (Windows runner 已预装)
       - name: Check WebView2
         shell: pwsh
         run: |
-          # 检查WebView2运行时
           $wv2 = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" -ErrorAction SilentlyContinue
           if ($wv2) {
-            Write-Host "WebView2已安装: $($wv2.pv)"
+            Write-Host "✅ WebView2: $($wv2.pv)"
           } else {
-            Write-Host "WebView2未检测到，但Tauri安装包会自动处理"
+            Write-Host "⚠️ WebView2 未检测到 (安装程序会自动处理)"
           }
 
-      # 6. 构建前端应用
+      # 7. 构建前端
       - name: Build frontend
         run: npm run build
         env:
@@ -87,8 +100,7 @@ jobs:
           YAAK_ENABLE_TELEMETRY: 'false'
           YAAK_ENABLE_UPDATER: 'false'
 
-      # 7. 构建Tauri应用（Windows NSIS安装包）
-      # 注意：GitHub Actions Windows runner已预装WebView2，无需额外安装
+      # 8. 构建 Tauri 应用
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -96,59 +108,36 @@ jobs:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Yaak Free v${{ github.ref_name }}'
+          tagName: ${{ inputs.version != '' && inputs.version || github.ref_name }}
+          releaseName: 'Yaak Free v${{ inputs.version != '' && inputs.version || github.ref_name }}'
           releaseBody: |
             ## Yaak 免费商用版本 (Windows amd64)
-            
-            ### 安装说明
-            1. 下载 `Yaak_${{ github.ref_name }}_x64-setup.exe`
-            2. 双击运行安装程序
-            3. 按照向导完成安装
-            
-            ### 版本特性
-            - ✅ 完全免费商用
-            - ✅ 无功能限制
-            - ✅ 无遥测/数据收集
-            - ✅ 离线优先设计
-            
-            ### 系统要求
-            - Windows 10 或更高版本 (64位)
-            - WebView2运行时（安装程序会自动检测/安装）
-            
-            **注意**: 这是社区构建的免费版本，基于MIT许可证开源。
+            - 触发源: ${{ github.event_name }}
+            - 引用: ${{ inputs.build_ref != '' && inputs.build_ref || github.ref }}
+            - 提交: ${{ github.sha }}
           releaseDraft: true
           prerelease: false
           args: '--target ${{ env.BUILD_TARGET }} --bundles nsis'
 
-      # 8. 上传构建产物
-      - name: Upload build artifacts
+      # 9. 上传产物
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: yaak-windows-free-${{ github.sha }}
           path: |
-            src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis/*.exe
+            crates-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis/*.exe
           if-no-files-found: warn
           retention-days: 7
 
-      # 9. 生成校验文件
+      # 10. 生成校验和 (仅 tag)
       - name: Generate checksums
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
-          $installerPath = "src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis"
-          if (Test-Path $installerPath) {
-            Get-ChildItem $installerPath -Filter *.exe | ForEach-Object {
+          $path = "crates-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis"
+          if (Test-Path $path) {
+            Get-ChildItem $path -Filter *.exe | ForEach-Object {
               $hash = Get-FileHash $_.FullName -Algorithm SHA256
-              "$($hash.Hash)  $($_.Name)" | Out-File -Append -FilePath "$installerPath/checksums.sha256"
+              "$($hash.Hash) $($_.Name)" | Out-File -Append -FilePath "$path/checksums.sha256"
             }
           }
-
-      # 10. 构建摘要
-      - name: Build summary
-        shell: bash
-        run: |
-          echo "✅ 构建完成!"
-          echo "版本: ${{ github.ref_name }}"
-          echo "目标平台: Windows amd64"
-          ls -la src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis/ || true
