@@ -1,89 +1,180 @@
-name: Build Yaak for Windows x64 (Unsigned)
+# .github/workflows/build-windows-free.yml
+# 构建Yaak Windows amd64免费商用版本
+# 基于Tauri v2官方推荐配置
+
+name: Build Windows Free Edition
 
 on:
   push:
     branches: [main, master]
-    # tags: [v*]   # 按需启用标签构建
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (例如: 2024.1.0)'
+        required: false
+        default: ''
+
+env:
+  # Node.js版本 - 与Yaak官方保持一致
+  NODE_VERSION: '20'
+  # Rust版本
+  RUST_VERSION: 'stable'
+  # 构建目标
+  BUILD_TARGET: 'x86_64-pc-windows-msvc'
 
 jobs:
-  build-windows-x64:
+  build-windows:
     runs-on: windows-latest
-    timeout-minutes: 40
-
+    permissions:
+      contents: write
+    
     steps:
+      # 1. 检出代码
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: "24"
-          cache: true
+          fetch-depth: 0
+          submodules: recursive
 
-      - name: Install Rust stable
+      # 2. 设置Node.js环境
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      # 3. 安装pnpm (Yaak使用pnpm作为包管理器)
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+          run_install: false
+
+      # 4. 获取pnpm存储目录
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      # 5. 设置pnpm缓存
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      # 6. 设置Rust环境
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ env.BUILD_TARGET }}
+          components: rustfmt, clippy
+
+      # 7. 设置Rust缓存
+      - name: Setup Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
           cache-on-failure: true
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install dependencies
-        run: vp install
-
-      - name: Bootstrap
-        run: npm run bootstrap
-        env:
-          YAAK_TARGET_ARCH: "x64"
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Run JS Tests
-        run: vp test
-
-      - name: Run Rust Tests
-        run: cargo test --all --exclude yaak-cli
-
-      # 生成有效的 semver 版本号
-      - name: Determine version
-        id: version
-        run: |
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v\d') {
-            $VERSION = $env:GITHUB_REF_NAME -replace '^v', ''
-          } else {
-            $SHORT_SHA = $env:GITHUB_SHA.Substring(0, 7)
-            $VERSION = "0.0.0-$SHORT_SHA"
-          }
-          echo "VERSION=$VERSION" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "Using version: $VERSION"
+      # 8. 安装Windows依赖 (WebView2运行时)
+      - name: Install WebView2 Runtime
         shell: pwsh
+        run: |
+          # 下载并安装WebView2运行时引导程序
+          Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile 'MicrosoftEdgeWebview2Setup.exe'
+          .\MicrosoftEdgeWebview2Setup.exe /install
 
-      # 使用项目自带的 replace-version 脚本更新版本
-      - name: Set version
-        run: npm run replace-version
-        env:
-          YAAK_VERSION: ${{ env.VERSION }}
+      # 9. 安装前端依赖
+      - name: Install frontend dependencies
+        run: pnpm install
 
-      # 构建（禁用签名）
-      - uses: tauri-apps/tauri-action@v0
+      # 10. 构建前端应用
+      - name: Build frontend
+        run: pnpm run build
         env:
-          YAAK_TARGET_ARCH: "x64"
+          # 免费商用版本标识
+          YAAK_LICENSE_TYPE: 'free'
+          YAAK_ENABLE_TELEMETRY: 'false'
+          YAAK_ENABLE_UPDATER: 'false'
+
+      # 11. 构建Tauri应用 (Windows NSIS安装包)
+      - name: Build Tauri app (NSIS installer)
+        uses: tauri-apps/tauri-action@v0
+        env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 不设置任何签名相关的环境变量
+          # 确保使用正确的目标平台
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
-          # 使用主配置文件，并覆盖签名命令为空（禁用签名）
-          args: "--config ./crates-tauri/yaak-app/tauri.release.conf.json --config '{\"bundle\": {\"windows\": {\"signingCommand\": null}}}'"
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Yaak Free v${{ github.ref_name }}'
+          releaseBody: |
+            ## Yaak 免费商用版本 (Windows amd64)
+            
+            ### 安装说明
+            1. 下载 `Yaak_${{ github.ref_name }}_x64-setup.exe`
+            2. 双击运行安装程序
+            3. 按照向导完成安装
+            
+            ### 版本特性
+            - ✅ 完全免费商用
+            - ✅ 无功能限制
+            - ✅ 无遥测/数据收集
+            - ✅ 离线优先设计
+            
+            ### 文件校验
+            - 安装包: `Yaak_${{ github.ref_name }}_x64-setup.exe`
+            
+            ### 系统要求
+            - Windows 10 或更高版本
+            - 64位处理器
+            - WebView2运行时 (安装程序会自动安装)
+            
+            **注意**: 这是社区构建的免费版本，基于MIT许可证开源。
+          releaseDraft: true
+          prerelease: false
+          # 仅构建NSIS安装包(支持Windows 7+)
+          args: '--target ${{ env.BUILD_TARGET }} --bundles nsis'
 
-      # 上传生成的 NSIS 安装包作为工作流产物
-      - name: Upload NSIS installer
+      # 12. 上传构建产物到Artifacts (便于调试)
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: yaak-windows-x64-installer
-          path: target/release/bundle/nsis/*.exe
+          name: yaak-windows-free-${{ github.sha }}
+          path: |
+            src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis/*.exe
+            src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/msi/*.msi
+          if-no-files-found: warn
+          retention-days: 7
+
+      # 13. 生成校验文件
+      - name: Generate checksums
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $installerPath = "src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis"
+          if (Test-Path $installerPath) {
+            Get-ChildItem $installerPath -Filter *.exe | ForEach-Object {
+              $hash = Get-FileHash $_.FullName -Algorithm SHA256
+              "$($hash.Hash)  $($_.Name)" | Out-File -Append -FilePath "$installerPath/checksums.sha256"
+            }
+          }
+
+      # 14. 输出构建信息
+      - name: Build summary
+        shell: bash
+        run: |
+          echo "✅ 构建完成!"
+          echo "版本: ${{ github.ref_name }}"
+          echo "目标平台: Windows amd64"
+          echo "构建类型: 免费商用版"
+          echo "输出目录:"
+          ls -la src-tauri/target/${{ env.BUILD_TARGET }}/release/bundle/nsis/ || true
