@@ -148,6 +148,14 @@ jobs:
             echo "name=Yaak Free v$REF_NAME" >> $GITHUB_OUTPUT
           fi
 
+      - name: Debug paths
+        shell: pwsh
+        run: |
+          Write-Host "PWD: $(Get-Location)"
+          Write-Host "Parent package.json: $(Test-Path ..\package.json)"
+          Write-Host "Grandparent package.json: $(Test-Path ..\..\package.json)"
+          Get-ChildItem -Force
+    
       # ─────────────────────────────────────────────────────
       # 🔧 修复: Tauri build - 使用步骤输出 + 修正产物路径
       # ─────────────────────────────────────────────────────
