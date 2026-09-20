@@ -10,7 +10,7 @@ use log::debug;
 use std::collections::BTreeMap;
 use tokio_stream::StreamExt;
 use tonic::Request;
-use tonic::body::BoxBody;
+use tonic::body::Body;
 use tonic::transport::Uri;
 use tonic_reflection::pb::v1::server_reflection_request::MessageRequest;
 use tonic_reflection::pb::v1::server_reflection_response::MessageResponse;
@@ -22,7 +22,7 @@ use tonic_reflection::pb::v1::{ExtensionRequest, FileDescriptorResponse};
 use tonic_reflection::pb::{v1, v1alpha};
 use yaak_tls::ClientCertificateConfig;
 
-pub struct AutoReflectionClient<T = Client<HttpsConnector<HttpConnector>, BoxBody>> {
+pub struct AutoReflectionClient<T = Client<HttpsConnector<HttpConnector>, Body>> {
     use_v1alpha: bool,
     client_v1: v1::server_reflection_client::ServerReflectionClient<T>,
     client_v1alpha: v1alpha::server_reflection_client::ServerReflectionClient<T>,
@@ -33,15 +33,21 @@ impl AutoReflectionClient {
         uri: &Uri,
         validate_certificates: bool,
         client_cert: Option<ClientCertificateConfig>,
+        max_message_size: usize,
     ) -> Result<Self> {
         let client_v1 = v1::server_reflection_client::ServerReflectionClient::with_origin(
             get_transport(validate_certificates, client_cert.clone())?,
             uri.clone(),
-        );
-        let client_v1alpha = v1alpha::server_reflection_client::ServerReflectionClient::with_origin(
-            get_transport(validate_certificates, client_cert.clone())?,
-            uri.clone(),
-        );
+        )
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size);
+        let client_v1alpha =
+            v1alpha::server_reflection_client::ServerReflectionClient::with_origin(
+                get_transport(validate_certificates, client_cert.clone())?,
+                uri.clone(),
+            )
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size);
         Ok(AutoReflectionClient { use_v1alpha: false, client_v1, client_v1alpha })
     }
 

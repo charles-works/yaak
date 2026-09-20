@@ -1,5 +1,7 @@
 import type { Context } from "@yaakapp/api";
 import { getRedirectUrlViaExternalBrowser } from "../callbackServer";
+import type { CustomParams } from "../customParams";
+import { applyQueryParams, NO_CUSTOM_PARAMS } from "../customParams";
 import type { AccessToken, AccessTokenRawResponse } from "../store";
 import { getDataDirKey, getToken, storeToken } from "../store";
 import { isTokenExpired } from "../util";
@@ -18,6 +20,7 @@ export async function getImplicit(
     audience,
     tokenName,
     externalBrowser,
+    customParams = NO_CUSTOM_PARAMS,
   }: {
     authorizationUrl: string;
     responseType: string;
@@ -28,6 +31,7 @@ export async function getImplicit(
     audience: string | null;
     tokenName: "access_token" | "id_token";
     externalBrowser?: ExternalBrowserOptions;
+    customParams?: CustomParams;
   },
 ): Promise<AccessToken> {
   const tokenArgs = {
@@ -37,7 +41,7 @@ export async function getImplicit(
     authorizationUrl: authorizationUrlRaw,
   };
   const token = await getToken(ctx, tokenArgs);
-  if (token != null && !isTokenExpired(token)) {
+  if (token != null && !isTokenExpired(token, tokenName)) {
     return token;
   }
 
@@ -58,6 +62,10 @@ export async function getImplicit(
       String(Math.floor(Math.random() * 9999999999999) + 1),
     );
   }
+
+  // Applied before redirect_uri, which belongs to the callback flow rather than
+  // to the user: overriding it would send the token somewhere nothing listens
+  applyQueryParams(authorizationUrl, customParams.authorizationQuery);
 
   let newToken: AccessToken;
 
@@ -137,7 +145,7 @@ async function getTokenViaEmbeddedBrowser(
 
         const response = Object.fromEntries(params) as unknown as AccessTokenRawResponse;
         try {
-          resolve(storeToken(ctx, tokenArgs, response));
+          resolve(storeToken(ctx, tokenArgs, response, tokenName));
         } catch (err) {
           reject(err);
         }
@@ -195,5 +203,5 @@ async function extractImplicitToken(
     response.id_token = idToken;
   }
 
-  return storeToken(ctx, tokenArgs, response);
+  return storeToken(ctx, tokenArgs, response, tokenName);
 }

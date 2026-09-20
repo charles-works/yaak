@@ -5,6 +5,7 @@ on:
 
 jobs:
   build-artifacts:
+    if: github.repository == 'mountain-loop/yaak'
     permissions:
       contents: write
 
@@ -14,38 +15,62 @@ jobs:
       matrix:
         include:
           - platform: "macos-latest" # for Arm-based Macs (M1 and above).
-            args: "--target aarch64-apple-darwin"
+            args: '--target aarch64-apple-darwin --config ./tauri.release.conf.json --config ''{"build":{"features":["updater","license","wry"]}}'''
             yaak_arch: "arm64"
             os: "macos"
+            runtime: "wry"
             targets: "aarch64-apple-darwin"
           - platform: "macos-latest" # for Intel-based Macs.
-            args: "--target x86_64-apple-darwin"
+            args: '--target x86_64-apple-darwin --config ./tauri.release.conf.json --config ''{"build":{"features":["updater","license","wry"]}}'''
             yaak_arch: "x64"
             os: "macos"
+            runtime: "wry"
             targets: "x86_64-apple-darwin"
           - platform: "ubuntu-22.04"
-            args: ""
+            args: '--config ./tauri.release.conf.json --config ''{"build":{"features":["updater","license","wry"]}}'''
             yaak_arch: "x64"
             os: "ubuntu"
+            runtime: "wry"
             targets: ""
           - platform: "ubuntu-22.04-arm"
-            args: ""
+            args: '--config ./tauri.release.conf.json --config ''{"build":{"features":["updater","license","wry"]}}'''
             yaak_arch: "arm64"
             os: "ubuntu"
+            runtime: "wry"
+            targets: ""
+          - platform: "ubuntu-22.04"
+            args: >-
+              --bundles deb
+              --config ./tauri.release.conf.json
+              --config '{"productName":"yaak-cef","mainBinaryName":"yaak-cef","identifier":"app.yaak.desktop.cef","build":{"features":["license","cef"]},"bundle":{"createUpdaterArtifacts":false}}'
+            yaak_arch: "x64"
+            os: "ubuntu"
+            runtime: "cef"
+            targets: ""
+          - platform: "ubuntu-22.04-arm"
+            args: >-
+              --bundles deb
+              --config ./tauri.release.conf.json
+              --config '{"productName":"yaak-cef","mainBinaryName":"yaak-cef","identifier":"app.yaak.desktop.cef","build":{"features":["license","cef"]},"bundle":{"createUpdaterArtifacts":false}}'
+            yaak_arch: "arm64"
+            os: "ubuntu"
+            runtime: "cef"
             targets: ""
           - platform: "windows-latest"
-            args: ""
+            args: '--config ./tauri.release.conf.json --config ''{"build":{"features":["updater","license","wry"]}}'''
             yaak_arch: "x64"
             os: "windows"
+            runtime: "wry"
             targets: ""
           # Windows ARM64
           - platform: "windows-latest"
-            args: "--target aarch64-pc-windows-msvc"
+            args: '--target aarch64-pc-windows-msvc --config ./tauri.release.conf.json --config ''{"build":{"features":["updater","license","wry"]}}'''
             yaak_arch: "arm64"
             os: "windows"
+            runtime: "wry"
             targets: "aarch64-pc-windows-msvc"
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 40
+    timeout-minutes: 360
     steps:
       - name: Checkout yaakapp/app
         uses: actions/checkout@v4
@@ -66,11 +91,30 @@ jobs:
           shared-key: ci
           cache-on-failure: true
 
+      - name: Cache CEF (Linux only)
+        if: matrix.os == 'ubuntu' && matrix.runtime == 'cef'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tauri-cef
+          key: cef-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
       - name: install dependencies (Linux only)
         if: matrix.os == 'ubuntu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y cmake ninja-build libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libnss3 patchelf xdg-utils
+          # crates/yaak-wasm compiles SQLite to wasm via sqlite-wasm-rs, whose C shim
+          # uses C23 [[noreturn]] and expects a freestanding wasm32 target. Ubuntu
+          # 22.04 ships only clang <=15: 14 rejects the attribute, and 15 falls
+          # through to host glibc headers ("bits/libc-header-start.h" not found).
+          # clang-18 handles it (it is what ubuntu-24.04 uses). Install it from
+          # apt.llvm.org since 22.04's repos stop at 15. Only the wasm build uses
+          # this compiler, so the shipped binary keeps 22.04's glibc floor.
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 18
+          echo "CC_wasm32_unknown_unknown=/usr/bin/clang-18" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=/usr/bin/llvm-ar-18" >> "$GITHUB_ENV"
 
       - name: Install Protoc for plugin-runtime
         uses: arduino/setup-protoc@v3
@@ -98,7 +142,7 @@ jobs:
       - name: Run JS Tests
         run: vp test
       - name: Run Rust Tests
-        run: cargo test --all --exclude yaak-cli
+        run: cargo test --all --exclude yaak-cli --features yaak-app-client/wry
 
       - name: Set version
         run: npm run replace-version
@@ -125,10 +169,11 @@ jobs:
           security list-keychain -d user -s $KEYCHAIN_PATH
 
           # Sign vendored binaries with hardened runtime and their specific entitlements
-          codesign --force --options runtime --entitlements crates-tauri/yaak-app/macos/entitlements.yaakprotoc.plist --sign "$APPLE_SIGNING_IDENTITY" crates-tauri/yaak-app/vendored/protoc/yaakprotoc || true
-          codesign --force --options runtime --entitlements crates-tauri/yaak-app/macos/entitlements.yaaknode.plist --sign "$APPLE_SIGNING_IDENTITY" crates-tauri/yaak-app/vendored/node/yaaknode || true
+          codesign --force --options runtime --entitlements crates-tauri/yaak-app-client/macos/entitlements.yaakprotoc.plist --sign "$APPLE_SIGNING_IDENTITY" crates-tauri/yaak-app-client/vendored/protoc/yaakprotoc || true
+          codesign --force --options runtime --entitlements crates-tauri/yaak-app-client/macos/entitlements.yaaknode.plist --sign "$APPLE_SIGNING_IDENTITY" crates-tauri/yaak-app-client/vendored/node/yaaknode || true
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build and upload Tauri bundles
+        uses: tauri-apps/tauri-action@v0
         env:
           YAAK_TARGET_ARCH: ${{ matrix.yaak_arch }}
 
@@ -150,12 +195,49 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ matrix.os == 'windows' && secrets.AZURE_CLIENT_SECRET }}
           AZURE_TENANT_ID: ${{ matrix.os == 'windows' && secrets.AZURE_TENANT_ID }}
         with:
+          # Also retries builds; upload retries alone cannot clean up starter assets.
+          retryAttempts: 3
+          tauriScript: "node ../../node_modules/@tauri-apps/cli/tauri.js"
           tagName: "v__VERSION__"
           releaseName: "Release __VERSION__"
-          releaseBody: "[Changelog __VERSION__](https://yaak.app/blog/__VERSION__)"
+          releaseBody: "<!-- generated-by-yaak-releases -->"
           releaseDraft: true
           prerelease: true
-          args: "${{ matrix.args }} --config ./crates-tauri/yaak-app/tauri.release.conf.json"
+          projectPath: ./crates-tauri/yaak-app-client
+          args: "${{ matrix.args }}"
+
+      # Snapshot before the per-machine build overwrites the regular NSIS bundle/signature.
+      - name: Snapshot Tauri bundles
+        if: ${{ !cancelled() }}
+        run: node .github/scripts/preserve-release-artifacts.mjs
+        env:
+          RELEASE_TARGET: ${{ matrix.targets }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+          RELEASE_RUNTIME: ${{ matrix.runtime }}
+          RELEASE_ARCH: ${{ matrix.yaak_arch }}
+          RELEASE_ARGS: ${{ matrix.args }}
+
+      - name: Build and upload CEF tarball from deb (Linux only)
+        if: matrix.os == 'ubuntu' && matrix.runtime == 'cef'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          deb=$(find target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' | head -n 1)
+          version="${GITHUB_REF_NAME#v}"
+          extract_dir="target/release/bundle/deb/yaak-cef-linux-${{ matrix.yaak_arch }}"
+          tarball="target/release/bundle/deb/yaak-cef_${version}_linux_${{ matrix.yaak_arch }}.tar.gz"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          dpkg-deb -x "$deb" "$extract_dir"
+          tar -C "$extract_dir" -czf "$tarball" .
+          for attempt in 1 2 3 4; do
+            if gh release upload "$GITHUB_REF_NAME" "$tarball" --clobber; then
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then exit 1; fi
+            sleep 10
+          done
 
       # Build a per-machine NSIS installer for enterprise deployment (PDQ, SCCM, Intune)
       - name: Build and upload machine-wide installer (Windows only)
@@ -171,12 +253,40 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         run: |
           Get-ChildItem -Recurse -Path target -File -Filter "*.exe.sig" | Remove-Item -Force
-          npx tauri bundle ${{ matrix.args }} --bundles nsis --config ./crates-tauri/yaak-app/tauri.release.conf.json --config '{"bundle":{"createUpdaterArtifacts":true,"windows":{"nsis":{"installMode":"perMachine"}}}}'
+          Push-Location crates-tauri/yaak-app-client
+          npx tauri bundle ${{ matrix.args }} --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":true,"windows":{"nsis":{"installMode":"perMachine"}}}}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
           $setup = Get-ChildItem -Recurse -Path target -Filter "*setup*.exe" | Select-Object -First 1
           $setupSig = "$($setup.FullName).sig"
           $dest = $setup.FullName -replace '-setup\.exe$', '-setup-machine.exe'
           $destSig = "$dest.sig"
           Copy-Item $setup.FullName $dest
           Copy-Item $setupSig $destSig
-          gh release upload "${{ github.ref_name }}" "$dest" --clobber
-          gh release upload "${{ github.ref_name }}" "$destSig" --clobber
+          foreach ($asset in @($dest, $destSig)) {
+            for ($attempt = 1; $attempt -le 4; $attempt++) {
+              gh release upload "$env:GITHUB_REF_NAME" "$asset" --clobber
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempt -eq 4) { exit $LASTEXITCODE }
+              Start-Sleep -Seconds 10
+            }
+          }
+
+      - name: Snapshot additional release bundles
+        if: ${{ !cancelled() }}
+        run: node .github/scripts/preserve-release-artifacts.mjs
+        env:
+          RELEASE_TARGET: ${{ matrix.targets }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+          RELEASE_RUNTIME: ${{ matrix.runtime }}
+          RELEASE_ARCH: ${{ matrix.yaak_arch }}
+          RELEASE_ARGS: ${{ matrix.args }}
+
+      - name: Retain release bundles for recovery
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.runtime }}-${{ matrix.yaak_arch }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/yaak-release-artifacts/
+          retention-days: 7
+          if-no-files-found: warn

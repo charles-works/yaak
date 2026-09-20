@@ -1,9 +1,11 @@
 use crate::error::Result;
 use crate::models::HttpRequestIden::{
     Authentication, AuthenticationType, Body, BodyType, CreatedAt, Description, FolderId, Headers,
-    Method, Name, SortPriority, UpdatedAt, Url, UrlParameters, WorkspaceId,
+    Method, Name, SettingFollowRedirects, SettingHttpVersion, SettingRequestTimeout,
+    SettingSendCookies, SettingStoreCookies, SettingValidateCertificates, SortPriority, UpdatedAt,
+    Url, UrlParameters, WorkspaceId,
 };
-use crate::util::{UpdateSource, generate_prefixed_id};
+use crate::util::generate_prefixed_id;
 use chrono::{NaiveDateTime, Utc};
 use rusqlite::Row;
 use schemars::JsonSchema;
@@ -16,6 +18,10 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
 use ts_rs::TS;
+use yaak_database::{Result as DbResult, UpdateSource};
+pub use yaak_database::{UpsertModelInfo, upsert_date};
+
+pub const DEFAULT_REQUEST_MESSAGE_SIZE: i32 = 64 * 1024 * 1024;
 
 #[macro_export]
 macro_rules! impl_model {
@@ -54,8 +60,22 @@ pub struct ProxySettingAuth {
     pub password: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
+impl Default for ClientCertificate {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: None,
+            crt_file: None,
+            key_file: None,
+            pfx_file: None,
+            passphrase: None,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 pub struct ClientCertificate {
     pub host: String,
@@ -69,13 +89,18 @@ pub struct ClientCertificate {
     pub pfx_file: Option<String>,
     #[serde(default)]
     pub passphrase: Option<String>,
-    #[serde(default = "default_true")]
     #[ts(optional, as = "Option<bool>")]
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
+impl Default for DnsOverride {
+    fn default() -> Self {
+        Self { hostname: String::new(), ipv4: Vec::new(), ipv6: Vec::new(), enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 pub struct DnsOverride {
     pub hostname: String,
@@ -83,9 +108,200 @@ pub struct DnsOverride {
     pub ipv4: Vec<String>,
     #[serde(default)]
     pub ipv6: Vec<String>,
-    #[serde(default = "default_true")]
     #[ts(optional, as = "Option<bool>")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ResolvedSetting<T> {
+    pub value: T,
+    pub source_model: String,
+    pub source_id: Option<String>,
+    pub source_name: Option<String>,
+}
+
+impl<T> ResolvedSetting<T> {
+    pub fn from_model(value: T, model: AnyModel) -> Self {
+        Self {
+            value,
+            source_model: model.model().to_string(),
+            source_id: Some(model.id().to_string()),
+            source_name: Some(model.resolved_name()),
+        }
+    }
+
+    pub fn default_source(value: T) -> Self {
+        Self { value, source_model: "default".to_string(), source_id: None, source_name: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedHttpRequestSettings {
+    pub validate_certificates: ResolvedSetting<bool>,
+    pub follow_redirects: ResolvedSetting<bool>,
+    pub request_timeout: ResolvedSetting<i32>,
+    pub request_message_size: ResolvedSetting<i32>,
+    pub send_cookies: ResolvedSetting<bool>,
+    pub store_cookies: ResolvedSetting<bool>,
+    pub http_version: ResolvedSetting<HttpVersion>,
+}
+
+impl Default for ResolvedHttpRequestSettings {
+    fn default() -> Self {
+        Self {
+            validate_certificates: ResolvedSetting::default_source(true),
+            follow_redirects: ResolvedSetting::default_source(true),
+            request_timeout: ResolvedSetting::default_source(0),
+            request_message_size: ResolvedSetting::default_source(DEFAULT_REQUEST_MESSAGE_SIZE),
+            send_cookies: ResolvedSetting::default_source(true),
+            store_cookies: ResolvedSetting::default_source(true),
+            http_version: ResolvedSetting::default_source(HttpVersion::Auto),
+        }
+    }
+}
+
+impl ResolvedHttpRequestSettings {
+    /// The `* Setting name=value` lines a send writes at the top of its timeline, sources and
+    /// all. Built here, once, so every host that runs a send — the desktop, the CLI, the browser
+    /// tab handing off to a proxy — records the same lines the same way.
+    pub fn timeline_events(&self) -> Vec<HttpResponseEventData> {
+        fn event<T>(
+            name: &str,
+            value: String,
+            setting: &ResolvedSetting<T>,
+        ) -> HttpResponseEventData {
+            HttpResponseEventData::Setting {
+                name: name.to_string(),
+                value,
+                source_model: Some(setting.source_model.clone()),
+                source_id: setting.source_id.clone(),
+                source_name: setting.source_name.clone(),
+            }
+        }
+        let timeout = if self.request_timeout.value > 0 {
+            format!("{:?}", std::time::Duration::from_millis(self.request_timeout.value as u64))
+        } else {
+            "Infinity".to_string()
+        };
+        vec![
+            event(
+                "validate_certificates",
+                self.validate_certificates.value.to_string(),
+                &self.validate_certificates,
+            ),
+            event("redirects", self.follow_redirects.value.to_string(), &self.follow_redirects),
+            event("timeout", timeout, &self.request_timeout),
+            event("send_cookies", self.send_cookies.value.to_string(), &self.send_cookies),
+            event("store_cookies", self.store_cookies.value.to_string(), &self.store_cookies),
+            event("http_version", self.http_version.value.to_string(), &self.http_version),
+        ]
+    }
+}
+
+/// The resolved send settings, values only: what an executor has to obey, with the sources
+/// (which model each came from) left behind in [`ResolvedHttpRequestSettings`]. This is what
+/// crosses from a tab to the Yaak server, and what the server reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct HttpSendSettings {
+    pub validate_certificates: bool,
+    pub follow_redirects: bool,
+    /// Milliseconds. Zero or negative means no timeout.
+    pub timeout_ms: i32,
+    pub send_cookies: bool,
+    pub store_cookies: bool,
+    #[serde(default)]
+    pub http_version: HttpVersion,
+}
+
+impl From<&ResolvedHttpRequestSettings> for HttpSendSettings {
+    fn from(s: &ResolvedHttpRequestSettings) -> Self {
+        Self {
+            validate_certificates: s.validate_certificates.value,
+            follow_redirects: s.follow_redirects.value,
+            timeout_ms: s.request_timeout.value,
+            send_cookies: s.send_cookies.value,
+            store_cookies: s.store_cookies.value,
+            http_version: s.http_version.value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct InheritedBoolSetting {
+    #[serde(default)]
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    pub value: bool,
+}
+
+impl Default for InheritedBoolSetting {
+    fn default() -> Self {
+        Self { enabled: false, value: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct InheritedIntSetting {
+    #[serde(default)]
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub value: i32,
+}
+
+impl Default for InheritedIntSetting {
+    fn default() -> Self {
+        Self { enabled: false, value: 0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum HttpVersion {
+    #[default]
+    Auto,
+    Http1,
+    Http2,
+}
+
+impl FromStr for HttpVersion {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "http1" => Ok(Self::Http1),
+            "http2" => Ok(Self::Http2),
+            _ => Ok(Self::Auto),
+        }
+    }
+}
+
+impl Display for HttpVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            HttpVersion::Auto => "auto",
+            HttpVersion::Http1 => "http1",
+            HttpVersion::Http2 => "http2",
+        };
+        write!(f, "{}", str)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+pub struct InheritedHttpVersionSetting {
+    #[serde(default)]
+    #[ts(optional, as = "Option<bool>")]
+    pub enabled: bool,
+    pub value: HttpVersion,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -160,6 +376,7 @@ pub struct Settings {
     pub theme_light: String,
     pub update_channel: String,
     pub hide_license_badge: bool,
+    pub prompt_feedback: bool,
     pub autoupdate: bool,
     pub auto_download_updates: bool,
     pub check_notifications: bool,
@@ -190,7 +407,7 @@ impl UpsertModelInfo for Settings {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use SettingsIden::*;
         let proxy = match self.proxy {
             None => None,
@@ -217,6 +434,7 @@ impl UpsertModelInfo for Settings {
             (ThemeLight, self.theme_light.as_str().into()),
             (UpdateChannel, self.update_channel.into()),
             (HideLicenseBadge, self.hide_license_badge.into()),
+            (PromptFeedback, self.prompt_feedback.into()),
             (Autoupdate, self.autoupdate.into()),
             (AutoDownloadUpdates, self.auto_download_updates.into()),
             (ColoredMethods, self.colored_methods.into()),
@@ -246,6 +464,7 @@ impl UpsertModelInfo for Settings {
             SettingsIden::ThemeLight,
             SettingsIden::UpdateChannel,
             SettingsIden::HideLicenseBadge,
+            SettingsIden::PromptFeedback,
             SettingsIden::Autoupdate,
             SettingsIden::AutoDownloadUpdates,
             SettingsIden::ColoredMethods,
@@ -286,6 +505,7 @@ impl UpsertModelInfo for Settings {
             autoupdate: row.get("autoupdate")?,
             auto_download_updates: row.get("auto_download_updates")?,
             hide_license_badge: row.get("hide_license_badge")?,
+            prompt_feedback: row.get("prompt_feedback")?,
             colored_methods: row.get("colored_methods")?,
             check_notifications: row.get("check_notifications")?,
             hotkeys: serde_json::from_str(&hotkeys).unwrap_or_default(),
@@ -293,7 +513,32 @@ impl UpsertModelInfo for Settings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            model: "workspace".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            authentication: BTreeMap::new(),
+            authentication_type: None,
+            description: String::new(),
+            headers: Vec::new(),
+            name: String::new(),
+            encryption_key_challenge: None,
+            setting_validate_certificates: true,
+            setting_follow_redirects: true,
+            setting_request_timeout: 0,
+            setting_request_message_size: DEFAULT_REQUEST_MESSAGE_SIZE,
+            setting_dns_overrides: Vec::new(),
+            setting_send_cookies: true,
+            setting_store_cookies: true,
+            setting_http_version: HttpVersion::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 #[enum_def(table_name = "workspaces")]
@@ -313,13 +558,15 @@ pub struct Workspace {
     pub encryption_key_challenge: Option<String>,
 
     // Settings
-    #[serde(default = "default_true")]
     pub setting_validate_certificates: bool,
-    #[serde(default = "default_true")]
     pub setting_follow_redirects: bool,
     pub setting_request_timeout: i32,
+    pub setting_request_message_size: i32,
     #[serde(default)]
     pub setting_dns_overrides: Vec<DnsOverride>,
+    pub setting_send_cookies: bool,
+    pub setting_store_cookies: bool,
+    pub setting_http_version: HttpVersion,
 }
 
 impl UpsertModelInfo for Workspace {
@@ -346,7 +593,7 @@ impl UpsertModelInfo for Workspace {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use WorkspaceIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -359,8 +606,12 @@ impl UpsertModelInfo for Workspace {
             (EncryptionKeyChallenge, self.encryption_key_challenge.into()),
             (SettingFollowRedirects, self.setting_follow_redirects.into()),
             (SettingRequestTimeout, self.setting_request_timeout.into()),
+            (SettingRequestMessageSize, self.setting_request_message_size.into()),
             (SettingValidateCertificates, self.setting_validate_certificates.into()),
             (SettingDnsOverrides, serde_json::to_string(&self.setting_dns_overrides)?.into()),
+            (SettingSendCookies, self.setting_send_cookies.into()),
+            (SettingStoreCookies, self.setting_store_cookies.into()),
+            (SettingHttpVersion, self.setting_http_version.to_string().into()),
         ])
     }
 
@@ -375,9 +626,12 @@ impl UpsertModelInfo for Workspace {
             WorkspaceIden::EncryptionKeyChallenge,
             WorkspaceIden::SettingRequestTimeout,
             WorkspaceIden::SettingFollowRedirects,
-            WorkspaceIden::SettingRequestTimeout,
+            WorkspaceIden::SettingRequestMessageSize,
             WorkspaceIden::SettingValidateCertificates,
             WorkspaceIden::SettingDnsOverrides,
+            WorkspaceIden::SettingSendCookies,
+            WorkspaceIden::SettingStoreCookies,
+            WorkspaceIden::SettingHttpVersion,
         ]
     }
 
@@ -388,6 +642,7 @@ impl UpsertModelInfo for Workspace {
         let headers: String = row.get("headers")?;
         let authentication: String = row.get("authentication")?;
         let setting_dns_overrides: String = row.get("setting_dns_overrides")?;
+        let setting_http_version: String = row.get("setting_http_version")?;
         Ok(Self {
             id: row.get("id")?,
             model: row.get("model")?,
@@ -401,8 +656,12 @@ impl UpsertModelInfo for Workspace {
             authentication_type: row.get("authentication_type")?,
             setting_follow_redirects: row.get("setting_follow_redirects")?,
             setting_request_timeout: row.get("setting_request_timeout")?,
+            setting_request_message_size: row.get("setting_request_message_size")?,
             setting_validate_certificates: row.get("setting_validate_certificates")?,
             setting_dns_overrides: serde_json::from_str(&setting_dns_overrides).unwrap_or_default(),
+            setting_send_cookies: row.get("setting_send_cookies")?,
+            setting_store_cookies: row.get("setting_store_cookies")?,
+            setting_http_version: setting_http_version.parse().unwrap_or_default(),
         })
     }
 }
@@ -453,7 +712,7 @@ impl UpsertModelInfo for WorkspaceMeta {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use WorkspaceMetaIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -489,7 +748,7 @@ impl UpsertModelInfo for WorkspaceMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export, export_to = "gen_models.ts")]
 pub enum CookieDomain {
     HostOnly(String),
@@ -498,20 +757,136 @@ pub enum CookieDomain {
     Empty,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export, export_to = "gen_models.ts")]
 pub enum CookieExpires {
     AtUtc(String),
     SessionEnd,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export, export_to = "gen_models.ts")]
+pub enum CookieSameSite {
+    Strict,
+    Lax,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 pub struct Cookie {
-    pub raw_cookie: String,
+    pub name: String,
+    pub value: String,
     pub domain: CookieDomain,
     pub expires: CookieExpires,
-    pub path: (String, bool),
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: Option<CookieSameSite>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CookieFields {
+    name: String,
+    value: String,
+    domain: CookieDomain,
+    expires: CookieExpires,
+    path: String,
+    #[serde(default)]
+    secure: bool,
+    #[serde(default)]
+    http_only: bool,
+    #[serde(default)]
+    same_site: Option<CookieSameSite>,
+}
+
+#[derive(Deserialize)]
+struct LegacyCookie {
+    raw_cookie: String,
+    domain: CookieDomain,
+    expires: CookieExpires,
+    path: (String, bool),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CookieCompat {
+    New(CookieFields),
+    Legacy(LegacyCookie),
+}
+
+impl<'de> Deserialize<'de> for Cookie {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match CookieCompat::deserialize(deserializer)? {
+            CookieCompat::New(cookie) => Self {
+                name: cookie.name,
+                value: cookie.value,
+                domain: cookie.domain,
+                expires: cookie.expires,
+                path: cookie.path,
+                secure: cookie.secure,
+                http_only: cookie.http_only,
+                same_site: cookie.same_site,
+            },
+            CookieCompat::Legacy(cookie) => {
+                let (name, value, secure, http_only, same_site) =
+                    parse_legacy_cookie_parts(&cookie.raw_cookie);
+                Self {
+                    name,
+                    value,
+                    domain: cookie.domain,
+                    expires: cookie.expires,
+                    path: cookie.path.0,
+                    secure,
+                    http_only,
+                    same_site,
+                }
+            }
+        })
+    }
+}
+
+fn parse_legacy_cookie_parts(
+    raw_cookie: &str,
+) -> (String, String, bool, bool, Option<CookieSameSite>) {
+    let mut parts = raw_cookie.split(';').map(str::trim);
+    let (name, value) = parts
+        .next()
+        .and_then(|part| {
+            let mut nv = part.splitn(2, '=');
+            Some((nv.next()?.trim().to_string(), nv.next().unwrap_or("").trim().to_string()))
+        })
+        .unwrap_or_default();
+
+    let mut secure = false;
+    let mut http_only = false;
+    let mut same_site = None;
+
+    for part in parts {
+        let mut attr = part.splitn(2, '=');
+        let key = attr.next().unwrap_or("").trim().to_lowercase();
+        let value = attr.next().unwrap_or("").trim().to_lowercase();
+        match key.as_str() {
+            "secure" => secure = true,
+            "httponly" => http_only = true,
+            "samesite" => {
+                same_site = match value.as_str() {
+                    "strict" => Some(CookieSameSite::Strict),
+                    "lax" => Some(CookieSameSite::Lax),
+                    "none" => Some(CookieSameSite::None),
+                    _ => same_site,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    (name, value, secure, http_only, same_site)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
@@ -554,7 +929,7 @@ impl UpsertModelInfo for CookieJar {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use CookieJarIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -642,7 +1017,7 @@ impl UpsertModelInfo for Environment {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use EnvironmentIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -700,11 +1075,16 @@ impl UpsertModelInfo for Environment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
+impl Default for EnvironmentVariable {
+    fn default() -> Self {
+        Self { enabled: true, name: String::new(), value: String::new(), id: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 pub struct EnvironmentVariable {
-    #[serde(default = "default_true")]
     #[ts(optional, as = "Option<bool>")]
     pub enabled: bool,
     pub name: String,
@@ -729,7 +1109,36 @@ pub struct ParentHeaders {
     pub headers: Vec<HttpRequestHeader>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, TS)]
+impl Default for Folder {
+    fn default() -> Self {
+        Self {
+            model: "folder".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            workspace_id: String::new(),
+            folder_id: None,
+            authentication: BTreeMap::new(),
+            authentication_type: None,
+            description: String::new(),
+            headers: Vec::new(),
+            name: String::new(),
+            sort_priority: 0.0,
+            setting_send_cookies: InheritedBoolSetting::default(),
+            setting_store_cookies: InheritedBoolSetting::default(),
+            setting_validate_certificates: InheritedBoolSetting::default(),
+            setting_follow_redirects: InheritedBoolSetting::default(),
+            setting_request_timeout: InheritedIntSetting::default(),
+            setting_request_message_size: InheritedIntSetting {
+                enabled: false,
+                value: DEFAULT_REQUEST_MESSAGE_SIZE,
+            },
+            setting_http_version: InheritedHttpVersionSetting::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 #[enum_def(table_name = "folders")]
@@ -749,6 +1158,13 @@ pub struct Folder {
     pub headers: Vec<HttpRequestHeader>,
     pub name: String,
     pub sort_priority: f64,
+    pub setting_send_cookies: InheritedBoolSetting,
+    pub setting_store_cookies: InheritedBoolSetting,
+    pub setting_validate_certificates: InheritedBoolSetting,
+    pub setting_follow_redirects: InheritedBoolSetting,
+    pub setting_request_timeout: InheritedIntSetting,
+    pub setting_request_message_size: InheritedIntSetting,
+    pub setting_http_version: InheritedHttpVersionSetting,
 }
 
 impl UpsertModelInfo for Folder {
@@ -775,7 +1191,7 @@ impl UpsertModelInfo for Folder {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use FolderIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -788,6 +1204,19 @@ impl UpsertModelInfo for Folder {
             (Description, self.description.into()),
             (Name, self.name.trim().into()),
             (SortPriority, self.sort_priority.into()),
+            (SettingSendCookies, serde_json::to_string(&self.setting_send_cookies)?.into()),
+            (SettingStoreCookies, serde_json::to_string(&self.setting_store_cookies)?.into()),
+            (
+                SettingValidateCertificates,
+                serde_json::to_string(&self.setting_validate_certificates)?.into(),
+            ),
+            (SettingFollowRedirects, serde_json::to_string(&self.setting_follow_redirects)?.into()),
+            (SettingRequestTimeout, serde_json::to_string(&self.setting_request_timeout)?.into()),
+            (
+                SettingRequestMessageSize,
+                serde_json::to_string(&self.setting_request_message_size)?.into(),
+            ),
+            (SettingHttpVersion, serde_json::to_string(&self.setting_http_version)?.into()),
         ])
     }
 
@@ -801,6 +1230,13 @@ impl UpsertModelInfo for Folder {
             FolderIden::Description,
             FolderIden::FolderId,
             FolderIden::SortPriority,
+            FolderIden::SettingSendCookies,
+            FolderIden::SettingStoreCookies,
+            FolderIden::SettingValidateCertificates,
+            FolderIden::SettingFollowRedirects,
+            FolderIden::SettingRequestTimeout,
+            FolderIden::SettingRequestMessageSize,
+            FolderIden::SettingHttpVersion,
         ]
     }
 
@@ -810,6 +1246,13 @@ impl UpsertModelInfo for Folder {
     {
         let headers: String = row.get("headers")?;
         let authentication: String = row.get("authentication")?;
+        let setting_send_cookies: String = row.get("setting_send_cookies")?;
+        let setting_store_cookies: String = row.get("setting_store_cookies")?;
+        let setting_validate_certificates: String = row.get("setting_validate_certificates")?;
+        let setting_follow_redirects: String = row.get("setting_follow_redirects")?;
+        let setting_request_timeout: String = row.get("setting_request_timeout")?;
+        let setting_request_message_size: String = row.get("setting_request_message_size")?;
+        let setting_http_version: String = row.get("setting_http_version")?;
         Ok(Self {
             id: row.get("id")?,
             model: row.get("model")?,
@@ -823,15 +1266,31 @@ impl UpsertModelInfo for Folder {
             headers: serde_json::from_str(&headers).unwrap_or_default(),
             authentication_type: row.get("authentication_type")?,
             authentication: serde_json::from_str(&authentication).unwrap_or_default(),
+            setting_send_cookies: serde_json::from_str(&setting_send_cookies).unwrap_or_default(),
+            setting_store_cookies: serde_json::from_str(&setting_store_cookies).unwrap_or_default(),
+            setting_validate_certificates: serde_json::from_str(&setting_validate_certificates)
+                .unwrap_or_default(),
+            setting_follow_redirects: serde_json::from_str(&setting_follow_redirects)
+                .unwrap_or_default(),
+            setting_request_timeout: serde_json::from_str(&setting_request_timeout)
+                .unwrap_or_default(),
+            setting_request_message_size: serde_json::from_str(&setting_request_message_size)
+                .unwrap_or_else(|_| default_request_message_size_setting()),
+            setting_http_version: serde_json::from_str(&setting_http_version).unwrap_or_default(),
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
+impl Default for HttpRequestHeader {
+    fn default() -> Self {
+        Self { enabled: true, name: String::new(), value: String::new(), id: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 pub struct HttpRequestHeader {
-    #[serde(default = "default_true")]
     #[ts(optional, as = "Option<bool>")]
     pub enabled: bool,
     pub name: String,
@@ -840,11 +1299,16 @@ pub struct HttpRequestHeader {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
+impl Default for HttpUrlParameter {
+    fn default() -> Self {
+        Self { enabled: true, name: String::new(), value: String::new(), id: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 pub struct HttpUrlParameter {
-    #[serde(default = "default_true")]
     #[ts(optional, as = "Option<bool>")]
     pub enabled: bool,
     /// Colon-prefixed parameters are treated as path parameters if they match, like `/users/:id`
@@ -855,7 +1319,37 @@ pub struct HttpUrlParameter {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
+impl Default for HttpRequest {
+    fn default() -> Self {
+        Self {
+            model: "http_request".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            workspace_id: String::new(),
+            folder_id: None,
+            authentication: BTreeMap::new(),
+            authentication_type: None,
+            body: BTreeMap::new(),
+            body_type: None,
+            description: String::new(),
+            headers: Vec::new(),
+            method: "GET".to_string(),
+            name: String::new(),
+            sort_priority: 0.0,
+            url: String::new(),
+            url_parameters: Vec::new(),
+            setting_send_cookies: InheritedBoolSetting::default(),
+            setting_store_cookies: InheritedBoolSetting::default(),
+            setting_validate_certificates: InheritedBoolSetting::default(),
+            setting_follow_redirects: InheritedBoolSetting::default(),
+            setting_request_timeout: InheritedIntSetting::default(),
+            setting_http_version: InheritedHttpVersionSetting::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 #[enum_def(table_name = "http_requests")]
@@ -876,13 +1370,18 @@ pub struct HttpRequest {
     pub body_type: Option<String>,
     pub description: String,
     pub headers: Vec<HttpRequestHeader>,
-    #[serde(default = "default_http_method")]
     pub method: String,
     pub name: String,
     pub sort_priority: f64,
     pub url: String,
     /// URL parameters used for both path placeholders (`:id`) and query string entries.
     pub url_parameters: Vec<HttpUrlParameter>,
+    pub setting_send_cookies: InheritedBoolSetting,
+    pub setting_store_cookies: InheritedBoolSetting,
+    pub setting_validate_certificates: InheritedBoolSetting,
+    pub setting_follow_redirects: InheritedBoolSetting,
+    pub setting_request_timeout: InheritedIntSetting,
+    pub setting_http_version: InheritedHttpVersionSetting,
 }
 
 impl UpsertModelInfo for HttpRequest {
@@ -909,7 +1408,7 @@ impl UpsertModelInfo for HttpRequest {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
             (UpdatedAt, upsert_date(source, self.updated_at)),
@@ -926,6 +1425,15 @@ impl UpsertModelInfo for HttpRequest {
             (AuthenticationType, self.authentication_type.into()),
             (Headers, serde_json::to_string(&self.headers)?.into()),
             (SortPriority, self.sort_priority.into()),
+            (SettingSendCookies, serde_json::to_string(&self.setting_send_cookies)?.into()),
+            (SettingStoreCookies, serde_json::to_string(&self.setting_store_cookies)?.into()),
+            (
+                SettingValidateCertificates,
+                serde_json::to_string(&self.setting_validate_certificates)?.into(),
+            ),
+            (SettingFollowRedirects, serde_json::to_string(&self.setting_follow_redirects)?.into()),
+            (SettingRequestTimeout, serde_json::to_string(&self.setting_request_timeout)?.into()),
+            (SettingHttpVersion, serde_json::to_string(&self.setting_http_version)?.into()),
         ])
     }
 
@@ -945,6 +1453,12 @@ impl UpsertModelInfo for HttpRequest {
             Url,
             UrlParameters,
             SortPriority,
+            SettingSendCookies,
+            SettingStoreCookies,
+            SettingValidateCertificates,
+            SettingFollowRedirects,
+            SettingRequestTimeout,
+            SettingHttpVersion,
         ]
     }
 
@@ -953,6 +1467,12 @@ impl UpsertModelInfo for HttpRequest {
         let body: String = row.get("body")?;
         let authentication: String = row.get("authentication")?;
         let headers: String = row.get("headers")?;
+        let setting_send_cookies: String = row.get("setting_send_cookies")?;
+        let setting_store_cookies: String = row.get("setting_store_cookies")?;
+        let setting_validate_certificates: String = row.get("setting_validate_certificates")?;
+        let setting_follow_redirects: String = row.get("setting_follow_redirects")?;
+        let setting_request_timeout: String = row.get("setting_request_timeout")?;
+        let setting_http_version: String = row.get("setting_http_version")?;
         Ok(Self {
             id: row.get("id")?,
             model: row.get("model")?,
@@ -971,6 +1491,15 @@ impl UpsertModelInfo for HttpRequest {
             sort_priority: row.get("sort_priority")?,
             url: row.get("url")?,
             url_parameters: serde_json::from_str(url_parameters.as_str()).unwrap_or_default(),
+            setting_send_cookies: serde_json::from_str(&setting_send_cookies).unwrap_or_default(),
+            setting_store_cookies: serde_json::from_str(&setting_store_cookies).unwrap_or_default(),
+            setting_validate_certificates: serde_json::from_str(&setting_validate_certificates)
+                .unwrap_or_default(),
+            setting_follow_redirects: serde_json::from_str(&setting_follow_redirects)
+                .unwrap_or_default(),
+            setting_request_timeout: serde_json::from_str(&setting_request_timeout)
+                .unwrap_or_default(),
+            setting_http_version: serde_json::from_str(&setting_http_version).unwrap_or_default(),
         })
     }
 }
@@ -1036,7 +1565,7 @@ impl UpsertModelInfo for WebsocketConnection {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use WebsocketConnectionIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -1101,7 +1630,36 @@ impl Default for WebsocketMessageType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
+impl Default for WebsocketRequest {
+    fn default() -> Self {
+        Self {
+            model: "websocket_request".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            workspace_id: String::new(),
+            folder_id: None,
+            authentication: BTreeMap::new(),
+            authentication_type: None,
+            description: String::new(),
+            headers: Vec::new(),
+            message: String::new(),
+            name: String::new(),
+            sort_priority: 0.0,
+            url: String::new(),
+            url_parameters: Vec::new(),
+            setting_send_cookies: InheritedBoolSetting::default(),
+            setting_store_cookies: InheritedBoolSetting::default(),
+            setting_validate_certificates: InheritedBoolSetting::default(),
+            setting_request_message_size: InheritedIntSetting {
+                enabled: false,
+                value: DEFAULT_REQUEST_MESSAGE_SIZE,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 #[enum_def(table_name = "websocket_requests")]
@@ -1125,6 +1683,10 @@ pub struct WebsocketRequest {
     pub url: String,
     /// URL parameters used for both path placeholders (`:id`) and query string entries.
     pub url_parameters: Vec<HttpUrlParameter>,
+    pub setting_send_cookies: InheritedBoolSetting,
+    pub setting_store_cookies: InheritedBoolSetting,
+    pub setting_validate_certificates: InheritedBoolSetting,
+    pub setting_request_message_size: InheritedIntSetting,
 }
 
 impl UpsertModelInfo for WebsocketRequest {
@@ -1151,7 +1713,7 @@ impl UpsertModelInfo for WebsocketRequest {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use WebsocketRequestIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -1167,6 +1729,16 @@ impl UpsertModelInfo for WebsocketRequest {
             (SortPriority, self.sort_priority.into()),
             (Url, self.url.into()),
             (UrlParameters, serde_json::to_string(&self.url_parameters)?.into()),
+            (SettingSendCookies, serde_json::to_string(&self.setting_send_cookies)?.into()),
+            (SettingStoreCookies, serde_json::to_string(&self.setting_store_cookies)?.into()),
+            (
+                SettingValidateCertificates,
+                serde_json::to_string(&self.setting_validate_certificates)?.into(),
+            ),
+            (
+                SettingRequestMessageSize,
+                serde_json::to_string(&self.setting_request_message_size)?.into(),
+            ),
         ])
     }
 
@@ -1184,6 +1756,10 @@ impl UpsertModelInfo for WebsocketRequest {
             WebsocketRequestIden::SortPriority,
             WebsocketRequestIden::Url,
             WebsocketRequestIden::UrlParameters,
+            WebsocketRequestIden::SettingSendCookies,
+            WebsocketRequestIden::SettingStoreCookies,
+            WebsocketRequestIden::SettingValidateCertificates,
+            WebsocketRequestIden::SettingRequestMessageSize,
         ]
     }
 
@@ -1194,6 +1770,10 @@ impl UpsertModelInfo for WebsocketRequest {
         let url_parameters: String = row.get("url_parameters")?;
         let authentication: String = row.get("authentication")?;
         let headers: String = row.get("headers")?;
+        let setting_send_cookies: String = row.get("setting_send_cookies")?;
+        let setting_store_cookies: String = row.get("setting_store_cookies")?;
+        let setting_validate_certificates: String = row.get("setting_validate_certificates")?;
+        let setting_request_message_size: String = row.get("setting_request_message_size")?;
         Ok(Self {
             id: row.get("id")?,
             model: row.get("model")?,
@@ -1210,6 +1790,12 @@ impl UpsertModelInfo for WebsocketRequest {
             headers: serde_json::from_str(headers.as_str()).unwrap_or_default(),
             folder_id: row.get("folder_id")?,
             name: row.get("name")?,
+            setting_send_cookies: serde_json::from_str(&setting_send_cookies).unwrap_or_default(),
+            setting_store_cookies: serde_json::from_str(&setting_store_cookies).unwrap_or_default(),
+            setting_validate_certificates: serde_json::from_str(&setting_validate_certificates)
+                .unwrap_or_default(),
+            setting_request_message_size: serde_json::from_str(&setting_request_message_size)
+                .unwrap_or_else(|_| default_request_message_size_setting()),
         })
     }
 }
@@ -1220,6 +1806,7 @@ impl UpsertModelInfo for WebsocketRequest {
 pub enum WebsocketEventType {
     Binary,
     Close,
+    Error,
     Frame,
     Open,
     Ping,
@@ -1276,7 +1863,7 @@ impl UpsertModelInfo for WebsocketEvent {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use WebsocketEventIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -1355,6 +1942,13 @@ pub struct HttpResponse {
     pub workspace_id: String,
     pub request_id: String,
 
+    /// Where the engine put the body, when it puts it in a file.
+    ///
+    /// Not exported to TypeScript: a path is only meaningful to a host that
+    /// has the filesystem it names, and bodies are moving off it. Read a body
+    /// by response id instead — the frontend through
+    /// `cmd_http_response_body_path`, plugins through `ctx.httpResponse.body`.
+    #[ts(skip)]
     pub body_path: Option<String>,
     pub content_length: Option<i32>,
     pub content_length_compressed: Option<i32>,
@@ -1397,7 +1991,7 @@ impl UpsertModelInfo for HttpResponse {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use HttpResponseIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -1491,6 +2085,15 @@ pub enum HttpResponseEventData {
     Setting {
         name: String,
         value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, as = "Option<String>")]
+        source_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, as = "Option<String>")]
+        source_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, as = "Option<String>")]
+        source_name: Option<String>,
     },
     Info {
         message: String,
@@ -1593,7 +2196,7 @@ impl UpsertModelInfo for HttpResponseEvent {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use HttpResponseEventIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -1681,7 +2284,7 @@ impl UpsertModelInfo for GraphQlIntrospection {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use GraphQlIntrospectionIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -1715,7 +2318,35 @@ impl UpsertModelInfo for GraphQlIntrospection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema, TS)]
+impl Default for GrpcRequest {
+    fn default() -> Self {
+        Self {
+            model: "grpc_request".to_string(),
+            id: String::new(),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+            workspace_id: String::new(),
+            folder_id: None,
+            authentication_type: None,
+            authentication: BTreeMap::new(),
+            description: String::new(),
+            message: String::new(),
+            metadata: Vec::new(),
+            method: None,
+            name: String::new(),
+            service: None,
+            sort_priority: 0.0,
+            url: String::new(),
+            setting_validate_certificates: InheritedBoolSetting::default(),
+            setting_request_message_size: InheritedIntSetting {
+                enabled: false,
+                value: DEFAULT_REQUEST_MESSAGE_SIZE,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(default, rename_all = "camelCase")]
 #[ts(export, export_to = "gen_models.ts")]
 #[enum_def(table_name = "grpc_requests")]
@@ -1740,6 +2371,8 @@ pub struct GrpcRequest {
     pub sort_priority: f64,
     /// Server URL (http for plaintext or https for secure)
     pub url: String,
+    pub setting_validate_certificates: InheritedBoolSetting,
+    pub setting_request_message_size: InheritedIntSetting,
 }
 
 impl UpsertModelInfo for GrpcRequest {
@@ -1766,7 +2399,7 @@ impl UpsertModelInfo for GrpcRequest {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use GrpcRequestIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -1783,6 +2416,14 @@ impl UpsertModelInfo for GrpcRequest {
             (AuthenticationType, self.authentication_type.into()),
             (Authentication, serde_json::to_string(&self.authentication)?.into()),
             (Metadata, serde_json::to_string(&self.metadata)?.into()),
+            (
+                SettingValidateCertificates,
+                serde_json::to_string(&self.setting_validate_certificates)?.into(),
+            ),
+            (
+                SettingRequestMessageSize,
+                serde_json::to_string(&self.setting_request_message_size)?.into(),
+            ),
         ])
     }
 
@@ -1801,6 +2442,8 @@ impl UpsertModelInfo for GrpcRequest {
             GrpcRequestIden::AuthenticationType,
             GrpcRequestIden::Authentication,
             GrpcRequestIden::Metadata,
+            GrpcRequestIden::SettingValidateCertificates,
+            GrpcRequestIden::SettingRequestMessageSize,
         ]
     }
 
@@ -1810,6 +2453,8 @@ impl UpsertModelInfo for GrpcRequest {
     {
         let authentication: String = row.get("authentication")?;
         let metadata: String = row.get("metadata")?;
+        let setting_validate_certificates: String = row.get("setting_validate_certificates")?;
+        let setting_request_message_size: String = row.get("setting_request_message_size")?;
         Ok(Self {
             id: row.get("id")?,
             model: row.get("model")?,
@@ -1827,6 +2472,10 @@ impl UpsertModelInfo for GrpcRequest {
             url: row.get("url")?,
             sort_priority: row.get("sort_priority")?,
             metadata: serde_json::from_str(metadata.as_str()).unwrap_or_default(),
+            setting_validate_certificates: serde_json::from_str(&setting_validate_certificates)
+                .unwrap_or_default(),
+            setting_request_message_size: serde_json::from_str(&setting_request_message_size)
+                .unwrap_or_else(|_| default_request_message_size_setting()),
         })
     }
 }
@@ -1893,7 +2542,7 @@ impl UpsertModelInfo for GrpcConnection {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use GrpcConnectionIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -2013,7 +2662,7 @@ impl UpsertModelInfo for GrpcEvent {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use GrpcEventIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -2144,7 +2793,7 @@ impl UpsertModelInfo for Plugin {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use PluginIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -2229,7 +2878,7 @@ impl UpsertModelInfo for SyncState {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use SyncStateIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -2312,7 +2961,7 @@ impl UpsertModelInfo for KeyValue {
     fn insert_values(
         self,
         source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
         use KeyValueIden::*;
         Ok(vec![
             (CreatedAt, upsert_date(source, self.created_at)),
@@ -2373,12 +3022,131 @@ impl<'s> TryFrom<&Row<'s>> for PluginKeyValue {
     }
 }
 
-fn default_true() -> bool {
-    true
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "import_sources")]
+pub struct ImportSource {
+    #[ts(type = "\"import_source\"")]
+    pub model: String,
+    pub id: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub workspace_id: String,
+
+    pub importer: String,
+    pub origin: String,
+    pub origin_label: String,
+    pub last_imported_at: NaiveDateTime,
 }
 
-fn default_http_method() -> String {
-    "GET".to_string()
+impl UpsertModelInfo for ImportSource {
+    fn table_name() -> impl IntoTableRef + IntoIden {
+        ImportSourceIden::Table
+    }
+
+    fn id_column() -> impl IntoIden + Eq + Clone {
+        ImportSourceIden::Id
+    }
+
+    fn generate_id() -> String {
+        generate_prefixed_id("im")
+    }
+
+    fn order_by() -> (impl IntoColumnRef, Order) {
+        (ImportSourceIden::CreatedAt, Desc)
+    }
+
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn insert_values(
+        self,
+        source: &UpdateSource,
+    ) -> DbResult<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>> {
+        use ImportSourceIden::*;
+        Ok(vec![
+            (CreatedAt, upsert_date(source, self.created_at)),
+            (UpdatedAt, upsert_date(source, self.updated_at)),
+            (WorkspaceId, self.workspace_id.into()),
+            (Importer, self.importer.into()),
+            (Origin, self.origin.into()),
+            (OriginLabel, self.origin_label.into()),
+            (LastImportedAt, self.last_imported_at.into()),
+        ])
+    }
+
+    fn update_columns() -> Vec<impl IntoIden> {
+        vec![
+            ImportSourceIden::UpdatedAt,
+            ImportSourceIden::Importer,
+            ImportSourceIden::Origin,
+            ImportSourceIden::OriginLabel,
+            ImportSourceIden::LastImportedAt,
+        ]
+    }
+
+    fn from_row(row: &Row) -> rusqlite::Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            id: row.get("id")?,
+            model: row.get("model")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            workspace_id: row.get("workspace_id")?,
+            importer: row.get("importer")?,
+            origin: row.get("origin")?,
+            origin_label: row.get("origin_label")?,
+            last_imported_at: row.get("last_imported_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, TS)]
+#[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_models.ts")]
+#[enum_def(table_name = "import_source_resources")]
+pub struct ImportSourceResource {
+    #[ts(type = "\"import_source_resource\"")]
+    pub model: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    pub import_source_id: String,
+    pub source_key: String,
+    pub model_type: String,
+    /// `None` once the user has decided not to import this key
+    #[ts(optional)]
+    pub model_id: Option<String>,
+    /// Hash of the resource as last applied or decided from the source, if one was recorded
+    #[ts(optional)]
+    pub content_hash: Option<String>,
+}
+
+impl<'s> TryFrom<&Row<'s>> for ImportSourceResource {
+    type Error = rusqlite::Error;
+
+    fn try_from(r: &Row<'s>) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            model: r.get("model")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+            import_source_id: r.get("import_source_id")?,
+            source_key: r.get("source_key")?,
+            model_type: r.get("model_type")?,
+            model_id: r.get("model_id")?,
+            content_hash: r.get("content_hash")?,
+        })
+    }
+}
+
+/// Only used as a `from_row` fallback for an unparseable settings column. The
+/// value a *new* model gets comes from that model's `Default` impl.
+fn default_request_message_size_setting() -> InheritedIntSetting {
+    InheritedIntSetting { enabled: false, value: DEFAULT_REQUEST_MESSAGE_SIZE }
 }
 
 #[macro_export]
@@ -2446,6 +3214,7 @@ define_any_model! {
     HttpRequest,
     HttpResponse,
     HttpResponseEvent,
+    ImportSource,
     KeyValue,
     Plugin,
     Settings,
@@ -2478,6 +3247,7 @@ impl<'de> Deserialize<'de> for AnyModel {
             Some(m) if m == "http_request" => HttpRequest(fv(value).unwrap()),
             Some(m) if m == "http_response" => HttpResponse(fv(value).unwrap()),
             Some(m) if m == "http_response_event" => HttpResponseEvent(fv(value).unwrap()),
+            Some(m) if m == "import_source" => ImportSource(fv(value).unwrap()),
             Some(m) if m == "key_value" => KeyValue(fv(value).unwrap()),
             Some(m) if m == "plugin" => Plugin(fv(value).unwrap()),
             Some(m) if m == "settings" => Settings(fv(value).unwrap()),
@@ -2525,36 +3295,64 @@ impl AnyModel {
     }
 }
 
-pub trait UpsertModelInfo {
-    fn table_name() -> impl IntoTableRef + IntoIden;
-    fn id_column() -> impl IntoIden + Eq + Clone;
-    fn generate_id() -> String;
-    fn order_by() -> (impl IntoColumnRef, Order);
-    fn get_id(&self) -> String;
-    fn insert_values(
-        self,
-        source: &UpdateSource,
-    ) -> Result<Vec<(impl IntoIden + Eq, impl Into<SimpleExpr>)>>;
-    fn update_columns() -> Vec<impl IntoIden>;
-    fn from_row(row: &Row) -> rusqlite::Result<Self>
-    where
-        Self: Sized;
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// Generate the created_at or updated_at timestamps for an upsert operation, depending on the ID
-// provided.
-fn upsert_date(update_source: &UpdateSource, dt: NaiveDateTime) -> SimpleExpr {
-    match update_source {
-        // Sync and import operations always preserve timestamps
-        UpdateSource::Sync | UpdateSource::Import => {
-            if dt.and_utc().timestamp() == 0 {
-                // Sometimes data won't have timestamps (partial data)
-                Utc::now().naive_utc().into()
-            } else {
-                dt.into()
-            }
-        }
-        // Other sources will always update to the latest time
-        _ => Utc::now().naive_utc().into(),
+    /// Every model below carries `#[serde(default)]` at the container level, so a
+    /// missing key is filled from `Default::default()`, which makes each `Default`
+    /// impl the single definition of that model's defaults.
+    ///
+    /// Deserializing `{}` therefore equals `Default::default()` by construction
+    /// today. What this catches is the two ways that can come apart again, both of
+    /// which have already bitten us:
+    ///
+    /// 1. A field-level `#[serde(default = "...")]` (or bare `#[serde(default)]`)
+    ///    added back on a field whose `Default` says something else. That is exactly
+    ///    the shape of the bug this replaced: `setting_send_cookies` deserialized as
+    ///    true but a derived `Default` produced false, so the bootstrapped workspace
+    ///    silently sent no cookies.
+    /// 2. The container-level `#[serde(default)]` being dropped, which turns every
+    ///    missing key into a deserialization error instead.
+    macro_rules! assert_default_matches_serde {
+        ($($t:ty),+ $(,)?) => {
+            $(
+                assert_eq!(
+                    serde_json::from_str::<$t>("{}").expect(concat!(
+                        stringify!($t),
+                        " must deserialize from an empty object"
+                    )),
+                    <$t>::default(),
+                    concat!(stringify!($t), ": Default::default() disagrees with its serde defaults"),
+                );
+            )+
+        };
+    }
+
+    #[test]
+    fn defaults_match_serde_defaults() {
+        assert_default_matches_serde!(
+            Workspace,
+            HttpRequest,
+            Folder,
+            GrpcRequest,
+            WebsocketRequest,
+            HttpRequestHeader,
+            HttpUrlParameter,
+            EnvironmentVariable,
+            DnsOverride,
+            ClientCertificate,
+            InheritedBoolSetting,
+            InheritedIntSetting,
+        );
+    }
+
+    #[test]
+    fn defaults_carry_their_model_name() {
+        assert_eq!(Workspace::default().model, "workspace");
+        assert_eq!(HttpRequest::default().model, "http_request");
+        assert_eq!(Folder::default().model, "folder");
+        assert_eq!(GrpcRequest::default().model, "grpc_request");
+        assert_eq!(WebsocketRequest::default().model, "websocket_request");
     }
 }

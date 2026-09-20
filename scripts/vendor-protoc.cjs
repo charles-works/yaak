@@ -1,7 +1,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const decompress = require("decompress");
 const Downloader = require("nodejs-file-downloader");
+const { extractArchive } = require("./extract-archive.cjs");
 const path = require("node:path");
 const { rmSync, mkdirSync, cpSync, existsSync, statSync, chmodSync } = require("node:fs");
 const { execSync } = require("node:child_process");
@@ -52,7 +52,7 @@ const SHA256_MAP = {
   [WIN_ARM]: "d7a207fb6eec0e4b1b6613be3b7d11905375b6fd1147a071116eb8e9f24ac53b",
 };
 
-const dstDir = path.join(__dirname, `..`, "crates-tauri", "yaak-app", "vendored", "protoc");
+const dstDir = path.join(__dirname, `..`, "crates-tauri", "yaak-app-client", "vendored", "protoc");
 const key = `${process.platform}_${process.env.YAAK_TARGET_ARCH ?? process.arch}`;
 console.log(`Vendoring protoc ${VERSION} for ${key}`);
 
@@ -86,7 +86,7 @@ mkdirSync(dstDir, { recursive: true });
   console.log("SHA256 verified:", actualHash);
 
   // Decompress to the same directory
-  await decompress(filePath, tmpDir, {});
+  await extractArchive(filePath, tmpDir);
 
   // Copy binary
   cpSync(binSrc, binDst);

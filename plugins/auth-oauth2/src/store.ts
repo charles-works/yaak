@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Context } from "@yaakapp/api";
+import { jwtExpiresAt } from "./util";
 
 export async function storeToken(
   ctx: Context,
@@ -11,7 +12,10 @@ export async function storeToken(
     throw new Error(`${tokenName} not found in response ${Object.keys(response).join(", ")}`);
   }
 
-  const expiresAt = response.expires_in ? Date.now() + response.expires_in * 1000 : null;
+  // Prefer expires_in from the response, falling back to the JWT's own exp claim
+  const expiresAt = response.expires_in
+    ? Date.now() + response.expires_in * 1000
+    : jwtExpiresAt(response[tokenName]);
   const token: AccessToken = {
     response,
     expiresAt,
@@ -43,6 +47,7 @@ export interface TokenStoreArgs {
   clientId: string;
   accessTokenUrl: string | null;
   authorizationUrl: string | null;
+  username?: string | null;
 }
 
 /**
@@ -55,6 +60,7 @@ function tokenStoreKey(args: TokenStoreArgs) {
   if (args.clientId) hash.update(args.clientId.trim());
   if (args.accessTokenUrl) hash.update(args.accessTokenUrl.trim().replace(/^https?:\/\//, ""));
   if (args.authorizationUrl) hash.update(args.authorizationUrl.trim().replace(/^https?:\/\//, ""));
+  if (args.username) hash.update(args.username);
   const key = hash.digest("hex");
   return ["token", key].join("::");
 }

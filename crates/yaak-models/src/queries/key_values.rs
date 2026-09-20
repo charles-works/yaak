@@ -1,13 +1,14 @@
-use crate::db_context::DbContext;
+use crate::client_db::{ClientDb, WriteDb};
 use crate::error::Result;
 use crate::models::{KeyValue, KeyValueIden, UpsertModelInfo};
 use crate::util::UpdateSource;
 use chrono::NaiveDateTime;
 use log::error;
+use sea_query::ExprTrait;
 use sea_query::{Asterisk, Cond, Expr, Query, SqliteQueryBuilder};
 use sea_query_rusqlite::RusqliteBinder;
 
-impl<'a> DbContext<'a> {
+impl<'a> ClientDb<'a> {
     pub fn list_key_values(&self) -> Result<Vec<KeyValue>> {
         let (sql, params) = Query::select()
             .from(KeyValueIden::Table)
@@ -18,7 +19,7 @@ impl<'a> DbContext<'a> {
             // TODO: Add migration to delete key/values with NULL IDs later on, then remove this
             .cond_where(Expr::col(KeyValueIden::Id).is_not_null())
             .build_rusqlite(SqliteQueryBuilder);
-        let mut stmt = self.conn.prepare(sql.as_str())?;
+        let mut stmt = self.conn().prepare(sql.as_str())?;
         let items = stmt.query_map(&*params.as_params(), KeyValue::from_row)?;
         Ok(items.map(|v| v.unwrap()).collect())
     }
@@ -86,9 +87,11 @@ impl<'a> DbContext<'a> {
                     .add(Expr::col(KeyValueIden::Key).eq(key)),
             )
             .build_rusqlite(SqliteQueryBuilder);
-        self.conn.resolve().query_row(sql.as_str(), &*params.as_params(), KeyValue::from_row).ok()
+        self.conn().resolve().query_row(sql.as_str(), &*params.as_params(), KeyValue::from_row).ok()
     }
+}
 
+impl<'a> WriteDb<'a> {
     pub fn set_key_value_dte(
         &self,
         namespace: &str,

@@ -7,7 +7,7 @@ pub enum Error {
     SqlError(#[from] rusqlite::Error),
 
     #[error("SQL Pool error: {0}")]
-    SqlPoolError(#[from] r2d2::Error),
+    SqlPoolError(#[from] yaak_database::PoolError),
 
     #[error("Database error: {0}")]
     Database(String),
@@ -33,11 +33,28 @@ pub enum Error {
     #[error("No base environment for {0}")]
     MissingBaseEnvironment(String),
 
+    #[error("Invalid environment selection: {0}")]
+    InvalidEnvironment(String),
+
     #[error("Multiple base environments for {0}. Delete duplicates before continuing.")]
     MultipleBaseEnvironments(String),
 
     #[error("unknown error")]
     Unknown,
+}
+
+impl From<yaak_database::Error> for Error {
+    fn from(e: yaak_database::Error) -> Self {
+        match e {
+            yaak_database::Error::SqlError(e) => Error::SqlError(e),
+            yaak_database::Error::SqlPoolError(e) => Error::SqlPoolError(e),
+            yaak_database::Error::Database(s) => Error::Database(s),
+            yaak_database::Error::Io(e) => Error::Io(e),
+            yaak_database::Error::JsonError(e) => Error::JsonError(e),
+            yaak_database::Error::ModelNotFound(s) => Error::ModelNotFound(s),
+            yaak_database::Error::MigrationError(s) => Error::MigrationError(s),
+        }
+    }
 }
 
 impl Serialize for Error {

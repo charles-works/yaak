@@ -1,6 +1,14 @@
 /* oxlint-disable no-explicit-any */
 import type { PartialImportResources } from "@yaakapp/api";
-import { convertId, convertTemplateSyntax, isJSObject } from "./common";
+import {
+  convertId,
+  convertTemplateSyntax,
+  createSourceKeys,
+  importHeaders,
+  importHttpBodyAndHeaders,
+  isJSObject,
+  type SourceKeys,
+} from "./common";
 
 export function convertInsomniaV5(parsed: any) {
   // Assert parsed is object
@@ -12,6 +20,7 @@ export function convertInsomniaV5(parsed: any) {
     return null;
   }
 
+  const keys = createSourceKeys();
   const resources: PartialImportResources = {
     environments: [],
     folders: [],
@@ -24,7 +33,7 @@ export function convertInsomniaV5(parsed: any) {
   // Import workspaces
   const meta = ("meta" in parsed ? parsed.meta : {}) as Record<string, any>;
   resources.workspaces.push({
-    id: convertId(meta.id ?? "collection"),
+    id: keys.own(meta.id ?? "collection"),
     createdAt: meta.created ? new Date(meta.created).toISOString().replace("Z", "") : undefined,
     updatedAt: meta.modified ? new Date(meta.modified).toISOString().replace("Z", "") : undefined,
     model: "workspace",
@@ -36,8 +45,10 @@ export function convertInsomniaV5(parsed: any) {
 
   // Import environments
   resources.environments.push(
-    importEnvironment(parsed.environments, meta.id, true),
-    ...(parsed.environments.subEnvironments ?? []).map((r: any) => importEnvironment(r, meta.id)),
+    importEnvironment(parsed.environments, meta.id, keys, true),
+    ...(parsed.environments.subEnvironments ?? []).map((r: any) =>
+      importEnvironment(r, meta.id, keys),
+    ),
   );
 
   // Import folders
@@ -46,16 +57,16 @@ export function convertInsomniaV5(parsed: any) {
       if (!isJSObject(child)) continue;
 
       if (Array.isArray(child.children)) {
-        const { folder, environment } = importFolder(child, meta.id, parentId);
+        const { folder, environment } = importFolder(child, meta.id, parentId, keys);
         resources.folders.push(folder);
         if (environment) resources.environments.push(environment);
         nextFolder(child.children, child.meta.id);
       } else if (child.method) {
-        resources.httpRequests.push(importHttpRequest(child, meta.id, parentId));
+        resources.httpRequests.push(importHttpRequest(child, meta.id, parentId, keys));
       } else if (child.protoFileId) {
-        resources.grpcRequests.push(importGrpcRequest(child, meta.id, parentId));
+        resources.grpcRequests.push(importGrpcRequest(child, meta.id, parentId, keys));
       } else if (child.url) {
-        resources.websocketRequests.push(importWebsocketRequest(child, meta.id, parentId));
+        resources.websocketRequests.push(importWebsocketRequest(child, meta.id, parentId, keys));
       }
     }
   };
@@ -69,53 +80,22 @@ export function convertInsomniaV5(parsed: any) {
   resources.environments = resources.environments.filter(Boolean);
   resources.workspaces = resources.workspaces.filter(Boolean);
 
-  return { resources: convertTemplateSyntax(resources) };
+  return { resources: convertTemplateSyntax(resources), sourceKeys: keys.all() };
 }
 
 function importHttpRequest(
   r: any,
   workspaceId: string,
   parentId: string,
+  keys: SourceKeys,
 ): PartialImportResources["httpRequests"][0] {
   const id = r.meta?.id ?? r._id;
   const created = r.meta?.created ?? r.created;
   const updated = r.meta?.modified ?? r.updated;
   const sortKey = r.meta?.sortKey ?? r.sortKey;
 
-  let bodyType: string | null = null;
-  let body = {};
-  if (r.body?.mimeType === "application/octet-stream") {
-    bodyType = "binary";
-    body = { filePath: r.body.fileName ?? "" };
-  } else if (r.body?.mimeType === "application/x-www-form-urlencoded") {
-    bodyType = "application/x-www-form-urlencoded";
-    body = {
-      form: (r.body.params ?? []).map((p: any) => ({
-        enabled: !p.disabled,
-        name: p.name ?? "",
-        value: p.value ?? "",
-      })),
-    };
-  } else if (r.body?.mimeType === "multipart/form-data") {
-    bodyType = "multipart/form-data";
-    body = {
-      form: (r.body.params ?? []).map((p: any) => ({
-        enabled: !p.disabled,
-        name: p.name ?? "",
-        value: p.value ?? "",
-        file: p.fileName ?? null,
-      })),
-    };
-  } else if (r.body?.mimeType === "application/graphql") {
-    bodyType = "graphql";
-    body = { text: r.body.text ?? "" };
-  } else if (r.body?.mimeType === "application/json") {
-    bodyType = "application/json";
-    body = { text: r.body.text ?? "" };
-  }
-
   return {
-    id: convertId(id),
+    id: keys.own(id),
     workspaceId: convertId(workspaceId),
     createdAt: created ? new Date(created).toISOString().replace("Z", "") : undefined,
     updatedAt: updated ? new Date(updated).toISOString().replace("Z", "") : undefined,
@@ -130,10 +110,8 @@ function importHttpRequest(
       name: p.name ?? "",
       value: p.value ?? "",
     })),
-    body,
-    bodyType,
+    ...importHttpBodyAndHeaders(r),
     method: r.method,
-    ...importHeaders(r),
     ...importAuthentication(r),
   };
 }
@@ -142,6 +120,7 @@ function importGrpcRequest(
   r: any,
   workspaceId: string,
   parentId: string,
+  keys: SourceKeys,
 ): PartialImportResources["grpcRequests"][0] {
   const id = r.meta?.id ?? r._id;
   const created = r.meta?.created ?? r.created;
@@ -154,7 +133,7 @@ function importGrpcRequest(
 
   return {
     model: "grpc_request",
-    id: convertId(id),
+    id: keys.own(id),
     workspaceId: convertId(workspaceId),
     createdAt: created ? new Date(created).toISOString().replace("Z", "") : undefined,
     updatedAt: updated ? new Date(updated).toISOString().replace("Z", "") : undefined,
@@ -180,6 +159,7 @@ function importWebsocketRequest(
   r: any,
   workspaceId: string,
   parentId: string,
+  keys: SourceKeys,
 ): PartialImportResources["websocketRequests"][0] {
   const id = r.meta?.id ?? r._id;
   const created = r.meta?.created ?? r.created;
@@ -188,7 +168,7 @@ function importWebsocketRequest(
 
   return {
     model: "websocket_request",
-    id: convertId(id),
+    id: keys.own(id),
     workspaceId: convertId(workspaceId),
     createdAt: created ? new Date(created).toISOString().replace("Z", "") : undefined,
     updatedAt: updated ? new Date(updated).toISOString().replace("Z", "") : undefined,
@@ -201,17 +181,6 @@ function importWebsocketRequest(
     ...importHeaders(r),
     ...importAuthentication(r),
   };
-}
-
-function importHeaders(obj: any) {
-  const headers = (obj.headers ?? [])
-    .map((h: any) => ({
-      enabled: !h.disabled,
-      name: h.name ?? "",
-      value: h.value ?? "",
-    }))
-    .filter(({ name, value }: any) => name !== "" || value !== "");
-  return { headers } as const;
 }
 
 function importAuthentication(obj: any) {
@@ -237,6 +206,7 @@ function importFolder(
   f: any,
   workspaceId: string,
   parentId: string,
+  keys: SourceKeys,
 ): {
   folder: PartialImportResources["folders"][0];
   environment: PartialImportResources["environments"][0] | null;
@@ -249,7 +219,7 @@ function importFolder(
   let environment: PartialImportResources["environments"][0] | null = null;
   if (Object.keys(f.environment ?? {}).length > 0) {
     environment = {
-      id: convertId(`${id}folder`),
+      id: keys.own(`${id}folder`),
       createdAt: created ? new Date(created).toISOString().replace("Z", "") : undefined,
       updatedAt: updated ? new Date(updated).toISOString().replace("Z", "") : undefined,
       workspaceId: convertId(workspaceId),
@@ -269,7 +239,7 @@ function importFolder(
   return {
     folder: {
       model: "folder",
-      id: convertId(id),
+      id: keys.own(id),
       createdAt: created ? new Date(created).toISOString().replace("Z", "") : undefined,
       updatedAt: updated ? new Date(updated).toISOString().replace("Z", "") : undefined,
       folderId: parentId === workspaceId ? null : convertId(parentId),
@@ -287,6 +257,7 @@ function importFolder(
 function importEnvironment(
   e: any,
   workspaceId: string,
+  keys: SourceKeys,
   isParent?: boolean,
 ): PartialImportResources["environments"][0] {
   const id = e.meta?.id ?? e._id;
@@ -295,7 +266,7 @@ function importEnvironment(
   const sortKey = e.meta?.sortKey ?? e.sortKey;
 
   return {
-    id: convertId(id),
+    id: keys.own(id),
     createdAt: created ? new Date(created).toISOString().replace("Z", "") : undefined,
     updatedAt: updated ? new Date(updated).toISOString().replace("Z", "") : undefined,
     workspaceId: convertId(workspaceId),

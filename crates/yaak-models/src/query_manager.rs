@@ -1,81 +1,81 @@
-use crate::connection_or_tx::ConnectionOrTx;
-use crate::db_context::DbContext;
+use crate::client_db::{ClientDb, WriteDb};
 use crate::error::Error::GenericError;
 use crate::util::ModelPayload;
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::TransactionBehavior;
-use std::sync::{Arc, Mutex, mpsc};
+use rusqlite::{Transaction, TransactionBehavior};
+use std::sync::mpsc;
+use yaak_database::{ConnectionOrTx, DbContext, SqlitePool};
 
+/// Reads come from a pool; writes go through one connection.
+///
+/// SQLite in WAL mode lets many readers run alongside a single writer, and
+/// never more than one writer. A second in-process writer can only wait, and
+/// while it waits in the busy handler it sleeps, retries, and keeps its pool
+/// slot. Enough of those and the pool is full of writers that are all asleep,
+/// and every read in the app queues behind them. Giving writes exactly one
+/// connection turns that into a plain queue: the next write starts the moment
+/// the previous one commits, and it never takes a slot a read could use.
+///
+/// The pools are internally synchronized — don't wrap them in a Mutex. A Mutex
+/// held across the blocking `get()` serializes every DB access behind the
+/// slowest waiter.
 #[derive(Debug, Clone)]
 pub struct QueryManager {
-    pool: Arc<Mutex<Pool<SqliteConnectionManager>>>,
+    readers: SqlitePool,
+    writer: SqlitePool,
     events_tx: mpsc::Sender<ModelPayload>,
 }
 
 impl QueryManager {
-    pub fn new(pool: Pool<SqliteConnectionManager>, events_tx: mpsc::Sender<ModelPayload>) -> Self {
-        QueryManager { pool: Arc::new(Mutex::new(pool)), events_tx }
+    /// `writer` must be a pool with a single connection; see [`crate::init_standalone`].
+    pub fn new(
+        readers: SqlitePool,
+        writer: SqlitePool,
+        events_tx: mpsc::Sender<ModelPayload>,
+    ) -> Self {
+        QueryManager { readers, writer, events_tx }
     }
 
-    pub fn connect(&self) -> DbContext<'_> {
-        let conn = self
-            .pool
-            .lock()
-            .expect("Failed to gain lock on DB")
-            .get()
-            .expect("Failed to get a new DB connection from the pool");
-        DbContext { _events_tx: self.events_tx.clone(), conn: ConnectionOrTx::Connection(conn) }
+    /// A read handle from the reader pool.
+    pub fn connect(&self) -> ClientDb<'_> {
+        let conn = self.readers.get().expect("Failed to get a new DB connection from the pool");
+        ClientDb::new(DbContext::new(ConnectionOrTx::Connection(conn)))
     }
 
-    pub fn with_conn<F, T>(&self, func: F) -> T
-    where
-        F: FnOnce(&DbContext) -> T,
-    {
-        let conn = self
-            .pool
-            .lock()
-            .expect("Failed to gain lock on DB for transaction")
-            .get()
-            .expect("Failed to get new DB connection from the pool");
-
-        let db_context = DbContext {
-            _events_tx: self.events_tx.clone(),
-            conn: ConnectionOrTx::Connection(conn),
-        };
-
-        func(&db_context)
-    }
-
+    /// Run `func` in a transaction on the writer connection.
+    ///
+    /// Waits for any write in progress to commit first, and fails with a pool
+    /// error if that takes longer than the pool's timeout. Do not call this
+    /// from inside another `with_tx` closure: the inner call would wait for
+    /// the outer transaction, which is waiting on it.
+    ///
+    /// Model events for the writes are sent once the transaction commits.
     pub fn with_tx<T, E>(
         &self,
-        func: impl FnOnce(&DbContext) -> std::result::Result<T, E>,
+        func: impl FnOnce(&WriteDb) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E>
     where
         E: From<crate::error::Error>,
     {
-        let mut conn = self
-            .pool
-            .lock()
-            .expect("Failed to gain lock on DB for transaction")
-            .get()
-            .expect("Failed to get new DB connection from the pool");
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .expect("Failed to start DB transaction");
+        let conn = self.writer.get().map_err(crate::error::Error::SqlPoolError)?;
+        // `new_unchecked` takes `&Connection`; see yaak_database::pool for why
+        // the pool never hands out `&mut`.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .map_err(crate::error::Error::SqlError)?;
 
-        let db_context = DbContext {
-            _events_tx: self.events_tx.clone(),
-            conn: ConnectionOrTx::Transaction(&tx),
-        };
+        let db = WriteDb::new(DbContext::new(ConnectionOrTx::Transaction(&tx)));
 
-        match func(&db_context) {
+        match func(&db) {
             Ok(val) => {
+                let events = db.into_events();
                 tx.commit()
                     .map_err(|e| GenericError(format!("Failed to commit transaction {e:?}")))?;
+                for payload in events {
+                    let _ = self.events_tx.send(payload);
+                }
                 Ok(val)
             }
             Err(e) => {
+                drop(db);
                 tx.rollback()
                     .map_err(|e| GenericError(format!("Failed to rollback transaction {e:?}")))?;
                 Err(e)

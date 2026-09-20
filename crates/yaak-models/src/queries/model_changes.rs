@@ -1,4 +1,4 @@
-use crate::db_context::DbContext;
+use crate::client_db::{ClientDb, WriteDb};
 use crate::error::Result;
 use crate::util::ModelPayload;
 use rusqlite::params;
@@ -11,13 +11,13 @@ pub struct PersistedModelChange {
     pub payload: ModelPayload,
 }
 
-impl<'a> DbContext<'a> {
+impl<'a> ClientDb<'a> {
     pub fn list_model_changes_after(
         &self,
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<PersistedModelChange>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn().prepare(
             r#"
                 SELECT id, created_at, payload
                 FROM model_changes
@@ -46,7 +46,7 @@ impl<'a> DbContext<'a> {
         since_id: i64,
         limit: usize,
     ) -> Result<Vec<PersistedModelChange>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn().prepare(
             r#"
                 SELECT id, created_at, payload
                 FROM model_changes
@@ -69,10 +69,12 @@ impl<'a> DbContext<'a> {
 
         Ok(items.collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?)
     }
+}
 
+impl<'a> WriteDb<'a> {
     pub fn prune_model_changes_older_than_days(&self, days: i64) -> Result<usize> {
         let offset = format!("-{days} days");
-        Ok(self.conn.resolve().execute(
+        Ok(self.conn().resolve().execute(
             r#"
                 DELETE FROM model_changes
                 WHERE created_at < STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW', ?1)
@@ -83,7 +85,7 @@ impl<'a> DbContext<'a> {
 
     pub fn prune_model_changes_older_than_hours(&self, hours: i64) -> Result<usize> {
         let offset = format!("-{hours} hours");
-        Ok(self.conn.resolve().execute(
+        Ok(self.conn().resolve().execute(
             r#"
                 DELETE FROM model_changes
                 WHERE created_at < STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW', ?1)
@@ -101,23 +103,36 @@ mod tests {
     use crate::util::{ModelChangeEvent, UpdateSource};
     use serde_json::json;
 
+    /// Startup bootstraps rows of its own; these tests count only their own.
+    fn clear_changes(query_manager: &crate::query_manager::QueryManager) {
+        query_manager
+            .with_tx(|db| {
+                db.conn().resolve().execute("DELETE FROM model_changes", [])?;
+                Ok::<_, crate::error::Error>(())
+            })
+            .expect("Failed to clear model changes");
+    }
+
     #[test]
     fn records_model_changes_for_upsert_and_delete() {
-        let (query_manager, _blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
-        let db = query_manager.connect();
+        let (query_manager, blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
+        clear_changes(&query_manager);
 
-        let workspace = db
-            .upsert_workspace(
-                &Workspace {
-                    name: "Changes Test".to_string(),
-                    setting_follow_redirects: true,
-                    setting_validate_certificates: true,
-                    ..Default::default()
-                },
-                &UpdateSource::Sync,
-            )
+        let workspace = query_manager
+            .with_tx(|db| {
+                db.upsert_workspace(
+                    &Workspace {
+                        name: "Changes Test".to_string(),
+                        setting_follow_redirects: true,
+                        setting_validate_certificates: true,
+                        ..Default::default()
+                    },
+                    &UpdateSource::Sync,
+                )
+            })
             .expect("Failed to upsert workspace");
 
+        let db = query_manager.connect();
         let created_changes = db.list_model_changes_after(0, 10).expect("Failed to list changes");
         assert_eq!(created_changes.len(), 1);
         assert_eq!(created_changes[0].payload.model.id(), workspace.id);
@@ -128,9 +143,14 @@ mod tests {
         ));
         assert!(matches!(created_changes[0].payload.update_source, UpdateSource::Sync));
 
-        db.delete_workspace_by_id(&workspace.id, &UpdateSource::Sync)
+        drop(db);
+        query_manager
+            .with_tx(|db| {
+                db.delete_workspace_by_id(&workspace.id, &UpdateSource::Sync, &blob_manager)
+            })
             .expect("Failed to delete workspace");
 
+        let db = query_manager.connect();
         let all_changes = db.list_model_changes_after(0, 10).expect("Failed to list changes");
         assert_eq!(all_changes.len(), 2);
         assert!(matches!(all_changes[1].payload.change, ModelChangeEvent::Delete));
@@ -146,23 +166,27 @@ mod tests {
     #[test]
     fn prunes_old_model_changes() {
         let (query_manager, _blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
+        clear_changes(&query_manager);
+
+        query_manager
+            .with_tx(|db| {
+                db.upsert_workspace(
+                    &Workspace {
+                        name: "Prune Test".to_string(),
+                        setting_follow_redirects: true,
+                        setting_validate_certificates: true,
+                        ..Default::default()
+                    },
+                    &UpdateSource::Sync,
+                )
+            })
+            .expect("Failed to upsert workspace");
+
         let db = query_manager.connect();
-
-        db.upsert_workspace(
-            &Workspace {
-                name: "Prune Test".to_string(),
-                setting_follow_redirects: true,
-                setting_validate_certificates: true,
-                ..Default::default()
-            },
-            &UpdateSource::Sync,
-        )
-        .expect("Failed to upsert workspace");
-
         let changes = db.list_model_changes_after(0, 10).expect("Failed to list changes");
         assert_eq!(changes.len(), 1);
 
-        db.conn
+        db.conn()
             .resolve()
             .execute(
                 "UPDATE model_changes SET created_at = '2000-01-01 00:00:00.000' WHERE id = ?1",
@@ -170,36 +194,46 @@ mod tests {
             )
             .expect("Failed to age model change row");
 
-        let pruned =
-            db.prune_model_changes_older_than_days(30).expect("Failed to prune model changes");
+        drop(db);
+        let pruned = query_manager
+            .with_tx(|db| db.prune_model_changes_older_than_days(30))
+            .expect("Failed to prune model changes");
         assert_eq!(pruned, 1);
-        assert!(db.list_model_changes_after(0, 10).expect("Failed to list changes").is_empty());
+        assert!(
+            query_manager
+                .connect()
+                .list_model_changes_after(0, 10)
+                .expect("Failed to list changes")
+                .is_empty()
+        );
     }
 
     #[test]
     fn list_model_changes_since_uses_timestamp_with_id_tiebreaker() {
-        let (query_manager, _blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
+        let (query_manager, blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
+        clear_changes(&query_manager);
+
+        query_manager
+            .with_tx(|db| {
+                let workspace = db.upsert_workspace(
+                    &Workspace {
+                        name: "Cursor Test".to_string(),
+                        setting_follow_redirects: true,
+                        setting_validate_certificates: true,
+                        ..Default::default()
+                    },
+                    &UpdateSource::Sync,
+                )?;
+                db.delete_workspace_by_id(&workspace.id, &UpdateSource::Sync, &blob_manager)
+            })
+            .expect("Failed to seed changes");
+
         let db = query_manager.connect();
-
-        let workspace = db
-            .upsert_workspace(
-                &Workspace {
-                    name: "Cursor Test".to_string(),
-                    setting_follow_redirects: true,
-                    setting_validate_certificates: true,
-                    ..Default::default()
-                },
-                &UpdateSource::Sync,
-            )
-            .expect("Failed to upsert workspace");
-        db.delete_workspace_by_id(&workspace.id, &UpdateSource::Sync)
-            .expect("Failed to delete workspace");
-
         let all = db.list_model_changes_after(0, 10).expect("Failed to list changes");
         assert_eq!(all.len(), 2);
 
         let fixed_ts = "2026-02-16 00:00:00.000";
-        db.conn
+        db.conn()
             .resolve()
             .execute("UPDATE model_changes SET created_at = ?1", params![fixed_ts])
             .expect("Failed to normalize timestamps");
@@ -213,23 +247,27 @@ mod tests {
     #[test]
     fn prunes_old_model_changes_by_hours() {
         let (query_manager, _blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
+        clear_changes(&query_manager);
+
+        query_manager
+            .with_tx(|db| {
+                db.upsert_workspace(
+                    &Workspace {
+                        name: "Prune Hour Test".to_string(),
+                        setting_follow_redirects: true,
+                        setting_validate_certificates: true,
+                        ..Default::default()
+                    },
+                    &UpdateSource::Sync,
+                )
+            })
+            .expect("Failed to upsert workspace");
+
         let db = query_manager.connect();
-
-        db.upsert_workspace(
-            &Workspace {
-                name: "Prune Hour Test".to_string(),
-                setting_follow_redirects: true,
-                setting_validate_certificates: true,
-                ..Default::default()
-            },
-            &UpdateSource::Sync,
-        )
-        .expect("Failed to upsert workspace");
-
         let changes = db.list_model_changes_after(0, 10).expect("Failed to list changes");
         assert_eq!(changes.len(), 1);
 
-        db.conn
+        db.conn()
             .resolve()
             .execute(
                 "UPDATE model_changes SET created_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW', '-2 hours') WHERE id = ?1",
@@ -237,14 +275,17 @@ mod tests {
             )
             .expect("Failed to age model change row");
 
-        let pruned =
-            db.prune_model_changes_older_than_hours(1).expect("Failed to prune model changes");
+        drop(db);
+        let pruned = query_manager
+            .with_tx(|db| db.prune_model_changes_older_than_hours(1))
+            .expect("Failed to prune model changes");
         assert_eq!(pruned, 1);
     }
 
     #[test]
     fn list_model_changes_deserializes_http_response_event_payload() {
         let (query_manager, _blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
+        clear_changes(&query_manager);
         let db = query_manager.connect();
 
         let payload = json!({
@@ -264,7 +305,7 @@ mod tests {
             "change": { "type": "upsert", "created": false }
         });
 
-        db.conn
+        db.conn()
             .resolve()
             .execute(
                 r#"

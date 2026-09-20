@@ -1,6 +1,6 @@
 use crate::api::{PluginVersion, download_plugin_archive, get_plugin};
 use crate::checksum::compute_checksum;
-use crate::error::Error::PluginErr;
+use crate::error::Error::{PluginErr, PluginNotFoundErr};
 use crate::error::Result;
 use crate::events::PluginContext;
 use crate::manager::PluginManager;
@@ -24,12 +24,12 @@ pub async fn delete_and_uninstall(
         Some(label) => UpdateSource::from_window_label(label),
         None => UpdateSource::Background,
     };
-    // Scope the db connection so it doesn't live across await
-    let plugin = {
-        let db = query_manager.connect();
-        db.delete_plugin_by_id(plugin_id, &update_source)?
-    };
-    plugin_manager.uninstall(plugin_context, plugin.directory.as_str()).await?;
+    let plugin = query_manager.with_tx(|db| db.delete_plugin_by_id(plugin_id, &update_source))?;
+    if let Err(err) = plugin_manager.uninstall(plugin_context, plugin.directory.as_str()).await {
+        if !matches!(err, PluginNotFoundErr(_)) {
+            return Err(err);
+        }
+    }
     Ok(plugin)
 }
 
@@ -65,12 +65,11 @@ pub async fn download_and_install(
     let _ = remove_dir_all(&plugin_dir);
     create_dir_all(&plugin_dir)?;
 
-    zip_extract::extract(Cursor::new(&bytes), &plugin_dir, true)?;
+    zip::ZipArchive::new(Cursor::new(&bytes))?
+        .extract_unwrapped_root_dir(&plugin_dir, zip::read::root_dir_common_filter)?;
     info!("Extracted plugin {} to {}", plugin_version.id, plugin_dir_str);
 
-    // Scope the db connection so it doesn't live across await
-    let plugin = {
-        let db = query_manager.connect();
+    let plugin = query_manager.with_tx(|db| {
         db.upsert_plugin(
             &Plugin {
                 id: plugin_version.id.clone(),
@@ -82,8 +81,8 @@ pub async fn download_and_install(
                 ..Default::default()
             },
             &UpdateSource::Background,
-        )?
-    };
+        )
+    })?;
 
     plugin_manager.add_plugin(plugin_context, &plugin).await?;
 

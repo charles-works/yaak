@@ -1,55 +1,21 @@
-use super::dedupe_headers;
-use crate::db_context::DbContext;
+use super::{conflict_free_name, merge_headers};
+use crate::client_db::{ClientDb, WriteDb};
 use crate::error::Result;
-use crate::models::{Folder, FolderIden, HttpRequest, HttpRequestHeader, HttpRequestIden};
+use crate::models::{
+    AnyModel, Folder, FolderIden, HttpRequest, HttpRequestHeader, HttpRequestIden,
+    ResolvedHttpRequestSettings, ResolvedSetting,
+};
 use crate::util::UpdateSource;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-impl<'a> DbContext<'a> {
+impl<'a> ClientDb<'a> {
     pub fn get_http_request(&self, id: &str) -> Result<HttpRequest> {
         self.find_one(HttpRequestIden::Id, id)
     }
 
     pub fn list_http_requests(&self, workspace_id: &str) -> Result<Vec<HttpRequest>> {
         self.find_many(HttpRequestIden::WorkspaceId, workspace_id, None)
-    }
-
-    pub fn delete_http_request(
-        &self,
-        m: &HttpRequest,
-        source: &UpdateSource,
-    ) -> Result<HttpRequest> {
-        self.delete_all_http_responses_for_request(m.id.as_str(), source)?;
-        self.delete(m, source)
-    }
-
-    pub fn delete_http_request_by_id(
-        &self,
-        id: &str,
-        source: &UpdateSource,
-    ) -> Result<HttpRequest> {
-        let http_request = self.get_http_request(id)?;
-        self.delete_http_request(&http_request, source)
-    }
-
-    pub fn duplicate_http_request(
-        &self,
-        http_request: &HttpRequest,
-        source: &UpdateSource,
-    ) -> Result<HttpRequest> {
-        let mut http_request = http_request.clone();
-        http_request.id = "".to_string();
-        http_request.sort_priority = http_request.sort_priority + 0.001;
-        self.upsert(&http_request, source)
-    }
-
-    pub fn upsert_http_request(
-        &self,
-        http_request: &HttpRequest,
-        source: &UpdateSource,
-    ) -> Result<HttpRequest> {
-        self.upsert(http_request, source)
     }
 
     pub fn resolve_auth_for_http_request(
@@ -86,9 +52,72 @@ impl<'a> DbContext<'a> {
             headers.append(&mut workspace_headers);
         }
 
-        headers.append(&mut http_request.headers.clone());
+        Ok(merge_headers(headers, http_request.headers.clone()))
+    }
 
-        Ok(dedupe_headers(headers))
+    pub fn resolve_settings_for_http_request(
+        &self,
+        http_request: &HttpRequest,
+    ) -> Result<ResolvedHttpRequestSettings> {
+        let parent = if let Some(folder_id) = http_request.folder_id.clone() {
+            let folder = self.get_folder(&folder_id)?;
+            self.resolve_settings_for_folder(&folder)?
+        } else {
+            let workspace = self.get_workspace(&http_request.workspace_id)?;
+            self.resolve_settings_for_workspace(&workspace)
+        };
+
+        Ok(ResolvedHttpRequestSettings {
+            validate_certificates: if http_request.setting_validate_certificates.enabled {
+                ResolvedSetting::from_model(
+                    http_request.setting_validate_certificates.value,
+                    AnyModel::HttpRequest(http_request.clone()),
+                )
+            } else {
+                parent.validate_certificates
+            },
+            follow_redirects: if http_request.setting_follow_redirects.enabled {
+                ResolvedSetting::from_model(
+                    http_request.setting_follow_redirects.value,
+                    AnyModel::HttpRequest(http_request.clone()),
+                )
+            } else {
+                parent.follow_redirects
+            },
+            request_timeout: if http_request.setting_request_timeout.enabled {
+                ResolvedSetting::from_model(
+                    http_request.setting_request_timeout.value,
+                    AnyModel::HttpRequest(http_request.clone()),
+                )
+            } else {
+                parent.request_timeout
+            },
+            request_message_size: parent.request_message_size,
+            send_cookies: if http_request.setting_send_cookies.enabled {
+                ResolvedSetting::from_model(
+                    http_request.setting_send_cookies.value,
+                    AnyModel::HttpRequest(http_request.clone()),
+                )
+            } else {
+                parent.send_cookies
+            },
+            store_cookies: if http_request.setting_store_cookies.enabled {
+                ResolvedSetting::from_model(
+                    http_request.setting_store_cookies.value,
+                    AnyModel::HttpRequest(http_request.clone()),
+                )
+            } else {
+                parent.store_cookies
+            },
+            http_version: if http_request.setting_http_version.enabled {
+                ResolvedSetting::from_model(
+                    http_request.setting_http_version.value,
+                    AnyModel::HttpRequest(http_request.clone()),
+                )
+            } else {
+                parent.http_version
+            },
+        })
     }
 
     pub fn list_http_requests_for_folder_recursive(
@@ -103,5 +132,181 @@ impl<'a> DbContext<'a> {
             children.push(m);
         }
         Ok(children)
+    }
+}
+
+impl<'a> WriteDb<'a> {
+    pub fn delete_http_request(
+        &self,
+        m: &HttpRequest,
+        source: &UpdateSource,
+    ) -> Result<HttpRequest> {
+        self.delete_all_http_responses_for_request(m.id.as_str(), source)?;
+        self.delete(m, source)
+    }
+
+    pub fn delete_http_request_by_id(
+        &self,
+        id: &str,
+        source: &UpdateSource,
+    ) -> Result<HttpRequest> {
+        let http_request = self.get_http_request(id)?;
+        self.delete_http_request(&http_request, source)
+    }
+
+    pub fn duplicate_http_request(
+        &self,
+        http_request: &HttpRequest,
+        source: &UpdateSource,
+    ) -> Result<HttpRequest> {
+        let mut http_request = http_request.clone();
+        http_request.id = "".to_string();
+        http_request.sort_priority = http_request.sort_priority + 0.001;
+        let sibling_names = self
+            .list_http_requests(&http_request.workspace_id)?
+            .into_iter()
+            .filter(|m| m.folder_id == http_request.folder_id)
+            .map(|m| m.name)
+            .collect::<Vec<_>>();
+        http_request.name = conflict_free_name(&http_request.name, &sibling_names);
+        self.upsert(&http_request, source)
+    }
+
+    pub fn upsert_http_request(
+        &self,
+        http_request: &HttpRequest,
+        source: &UpdateSource,
+    ) -> Result<HttpRequest> {
+        self.upsert(http_request, source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::init_in_memory;
+    use crate::models::{
+        Folder, HttpRequest, HttpRequestHeader, HttpVersion, InheritedHttpVersionSetting, Workspace,
+    };
+    use crate::util::UpdateSource;
+
+    #[test]
+    fn request_resolution_preserves_duplicate_request_headers() {
+        let (query_manager, _blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
+        let workspace = query_manager
+            .with_tx(|tx| tx.upsert_workspace(&Workspace::default(), &UpdateSource::Background))
+            .expect("Failed to create workspace");
+        let db = query_manager.connect();
+        let request = HttpRequest {
+            workspace_id: workspace.id,
+            headers: vec![
+                HttpRequestHeader {
+                    name: "Cookie".to_string(),
+                    value: "required=1".to_string(),
+                    ..Default::default()
+                },
+                HttpRequestHeader {
+                    enabled: false,
+                    name: "Cookie".to_string(),
+                    value: "optional=1".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let resolved = db.resolve_headers_for_http_request(&request).expect("Failed to resolve");
+        let cookies = resolved
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("cookie"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0].value, "required=1");
+        assert_eq!(cookies[1].value, "optional=1");
+        assert!(!cookies[1].enabled);
+    }
+
+    #[test]
+    fn http_version_resolves_through_the_inheritance_chain() {
+        let (query_manager, _blob_manager, _rx) = init_in_memory().expect("Failed to init DB");
+        let source = &UpdateSource::Background;
+
+        let (folder, request) = query_manager
+            .with_tx(|db| {
+                let workspace = db.upsert_workspace(
+                    &Workspace {
+                        name: "Test".to_string(),
+                        setting_http_version: HttpVersion::Http2,
+                        ..Default::default()
+                    },
+                    source,
+                )?;
+                let folder = db.upsert_folder(
+                    &Folder { workspace_id: workspace.id.clone(), ..Default::default() },
+                    source,
+                )?;
+                let request = db.upsert_http_request(
+                    &HttpRequest {
+                        workspace_id: workspace.id.clone(),
+                        folder_id: Some(folder.id.clone()),
+                        ..Default::default()
+                    },
+                    source,
+                )?;
+                Ok::<_, crate::error::Error>((folder, request))
+            })
+            .expect("Failed to seed");
+
+        // No overrides, so the workspace base value applies
+        let resolved = query_manager
+            .connect()
+            .resolve_settings_for_http_request(&request)
+            .expect("Failed to resolve");
+        assert_eq!(resolved.http_version.value, HttpVersion::Http2);
+        assert_eq!(resolved.http_version.source_model, "workspace");
+
+        // A folder override beats the workspace base
+        query_manager
+            .with_tx(|db| {
+                db.upsert_folder(
+                    &Folder {
+                        setting_http_version: InheritedHttpVersionSetting {
+                            enabled: true,
+                            value: HttpVersion::Http1,
+                        },
+                        ..folder
+                    },
+                    source,
+                )
+            })
+            .expect("Failed to update folder");
+        let resolved = query_manager
+            .connect()
+            .resolve_settings_for_http_request(&request)
+            .expect("Failed to resolve");
+        assert_eq!(resolved.http_version.value, HttpVersion::Http1);
+        assert_eq!(resolved.http_version.source_model, "folder");
+
+        // A request override beats them both
+        let request = query_manager
+            .with_tx(|db| {
+                db.upsert_http_request(
+                    &HttpRequest {
+                        setting_http_version: InheritedHttpVersionSetting {
+                            enabled: true,
+                            value: HttpVersion::Auto,
+                        },
+                        ..request
+                    },
+                    source,
+                )
+            })
+            .expect("Failed to update request");
+        let resolved = query_manager
+            .connect()
+            .resolve_settings_for_http_request(&request)
+            .expect("Failed to resolve");
+        assert_eq!(resolved.http_version.value, HttpVersion::Auto);
+        assert_eq!(resolved.http_version.source_model, "http_request");
     }
 }

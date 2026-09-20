@@ -1,15 +1,17 @@
+use super::{conflict_free_name, merge_headers};
+use crate::client_db::{ClientDb, WriteDb};
 use crate::connection_or_tx::ConnectionOrTx;
-use crate::db_context::DbContext;
 use crate::error::Result;
 use crate::models::{
-    Environment, EnvironmentIden, Folder, FolderIden, GrpcRequest, GrpcRequestIden, HttpRequest,
-    HttpRequestHeader, HttpRequestIden, WebsocketRequest, WebsocketRequestIden,
+    AnyModel, Environment, EnvironmentIden, Folder, FolderIden, GrpcRequest, GrpcRequestIden,
+    HttpRequest, HttpRequestHeader, HttpRequestIden, ResolvedHttpRequestSettings, ResolvedSetting,
+    WebsocketRequest, WebsocketRequestIden,
 };
 use crate::util::UpdateSource;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-impl<'a> DbContext<'a> {
+impl<'a> ClientDb<'a> {
     pub fn get_folder(&self, id: &str) -> Result<Folder> {
         self.find_one(FolderIden::Id, id)
     }
@@ -18,8 +20,116 @@ impl<'a> DbContext<'a> {
         self.find_many(FolderIden::WorkspaceId, workspace_id, None)
     }
 
+    pub fn resolve_auth_for_folder(
+        &self,
+        folder: &Folder,
+    ) -> Result<(Option<String>, BTreeMap<String, Value>, String)> {
+        if let Some(at) = folder.authentication_type.clone() {
+            return Ok((Some(at), folder.authentication.clone(), folder.id.clone()));
+        }
+
+        if let Some(folder_id) = folder.folder_id.clone() {
+            let folder = self.get_folder(&folder_id)?;
+            return self.resolve_auth_for_folder(&folder);
+        }
+
+        let workspace = self.get_workspace(&folder.workspace_id)?;
+        Ok(self.resolve_auth_for_workspace(&workspace))
+    }
+
+    pub fn resolve_headers_for_folder(&self, folder: &Folder) -> Result<Vec<HttpRequestHeader>> {
+        let mut headers = Vec::new();
+
+        if let Some(folder_id) = folder.folder_id.clone() {
+            let parent_folder = self.get_folder(&folder_id)?;
+            let mut folder_headers = self.resolve_headers_for_folder(&parent_folder)?;
+            // NOTE: Add parent headers first, so overrides are logical
+            headers.append(&mut folder_headers);
+        } else {
+            let workspace = self.get_workspace(&folder.workspace_id)?;
+            let mut workspace_headers = self.resolve_headers_for_workspace(&workspace);
+            headers.append(&mut workspace_headers);
+        }
+
+        Ok(merge_headers(headers, folder.headers.clone()))
+    }
+
+    pub fn resolve_settings_for_folder(
+        &self,
+        folder: &Folder,
+    ) -> Result<ResolvedHttpRequestSettings> {
+        let parent = if let Some(folder_id) = folder.folder_id.clone() {
+            let parent_folder = self.get_folder(&folder_id)?;
+            self.resolve_settings_for_folder(&parent_folder)?
+        } else {
+            let workspace = self.get_workspace(&folder.workspace_id)?;
+            self.resolve_settings_for_workspace(&workspace)
+        };
+
+        Ok(ResolvedHttpRequestSettings {
+            validate_certificates: if folder.setting_validate_certificates.enabled {
+                ResolvedSetting::from_model(
+                    folder.setting_validate_certificates.value,
+                    AnyModel::Folder(folder.clone()),
+                )
+            } else {
+                parent.validate_certificates
+            },
+            follow_redirects: if folder.setting_follow_redirects.enabled {
+                ResolvedSetting::from_model(
+                    folder.setting_follow_redirects.value,
+                    AnyModel::Folder(folder.clone()),
+                )
+            } else {
+                parent.follow_redirects
+            },
+            request_timeout: if folder.setting_request_timeout.enabled {
+                ResolvedSetting::from_model(
+                    folder.setting_request_timeout.value,
+                    AnyModel::Folder(folder.clone()),
+                )
+            } else {
+                parent.request_timeout
+            },
+            request_message_size: if folder.setting_request_message_size.enabled {
+                ResolvedSetting::from_model(
+                    folder.setting_request_message_size.value,
+                    AnyModel::Folder(folder.clone()),
+                )
+            } else {
+                parent.request_message_size
+            },
+            send_cookies: if folder.setting_send_cookies.enabled {
+                ResolvedSetting::from_model(
+                    folder.setting_send_cookies.value,
+                    AnyModel::Folder(folder.clone()),
+                )
+            } else {
+                parent.send_cookies
+            },
+            store_cookies: if folder.setting_store_cookies.enabled {
+                ResolvedSetting::from_model(
+                    folder.setting_store_cookies.value,
+                    AnyModel::Folder(folder.clone()),
+                )
+            } else {
+                parent.store_cookies
+            },
+            http_version: if folder.setting_http_version.enabled {
+                ResolvedSetting::from_model(
+                    folder.setting_http_version.value,
+                    AnyModel::Folder(folder.clone()),
+                )
+            } else {
+                parent.http_version
+            },
+        })
+    }
+}
+
+impl<'a> WriteDb<'a> {
     pub fn delete_folder(&self, folder: &Folder, source: &UpdateSource) -> Result<Folder> {
-        match self.conn {
+        match self.conn() {
             ConnectionOrTx::Connection(_) => {}
             ConnectionOrTx::Transaction(_) => {}
         }
@@ -61,14 +171,19 @@ impl<'a> DbContext<'a> {
     pub fn duplicate_folder(&self, src_folder: &Folder, source: &UpdateSource) -> Result<Folder> {
         let fid = &src_folder.id;
 
-        let new_folder = self.upsert_folder(
-            &Folder {
-                id: "".into(),
-                sort_priority: src_folder.sort_priority + 0.001,
-                ..src_folder.clone()
-            },
-            source,
-        )?;
+        let mut folder = Folder {
+            id: "".into(),
+            sort_priority: src_folder.sort_priority + 0.001,
+            ..src_folder.clone()
+        };
+        let sibling_names = self
+            .list_folders(&folder.workspace_id)?
+            .into_iter()
+            .filter(|f| f.folder_id == folder.folder_id)
+            .map(|f| f.name)
+            .collect::<Vec<_>>();
+        folder.name = conflict_free_name(&folder.name, &sibling_names);
+        let new_folder = self.upsert_folder(&folder, source)?;
 
         for m in self.find_many::<HttpRequest>(HttpRequestIden::FolderId, fid, None)? {
             self.upsert_http_request(
@@ -104,41 +219,5 @@ impl<'a> DbContext<'a> {
         }
 
         Ok(new_folder)
-    }
-
-    pub fn resolve_auth_for_folder(
-        &self,
-        folder: &Folder,
-    ) -> Result<(Option<String>, BTreeMap<String, Value>, String)> {
-        if let Some(at) = folder.authentication_type.clone() {
-            return Ok((Some(at), folder.authentication.clone(), folder.id.clone()));
-        }
-
-        if let Some(folder_id) = folder.folder_id.clone() {
-            let folder = self.get_folder(&folder_id)?;
-            return self.resolve_auth_for_folder(&folder);
-        }
-
-        let workspace = self.get_workspace(&folder.workspace_id)?;
-        Ok(self.resolve_auth_for_workspace(&workspace))
-    }
-
-    pub fn resolve_headers_for_folder(&self, folder: &Folder) -> Result<Vec<HttpRequestHeader>> {
-        let mut headers = Vec::new();
-
-        if let Some(folder_id) = folder.folder_id.clone() {
-            let parent_folder = self.get_folder(&folder_id)?;
-            let mut folder_headers = self.resolve_headers_for_folder(&parent_folder)?;
-            // NOTE: Add parent headers first, so overrides are logical
-            headers.append(&mut folder_headers);
-        } else {
-            let workspace = self.get_workspace(&folder.workspace_id)?;
-            let mut workspace_headers = self.resolve_headers_for_workspace(&workspace);
-            headers.append(&mut workspace_headers);
-        }
-
-        headers.append(&mut folder.headers.clone());
-
-        Ok(headers)
     }
 }

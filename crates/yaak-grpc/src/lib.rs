@@ -18,15 +18,17 @@ pub fn serialize_options() -> SerializeOptions {
     SerializeOptions::new().skip_default_fields(false)
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, ts_rs::TS)]
 #[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_grpc.ts")]
 pub struct ServiceDefinition {
     pub name: String,
     pub methods: Vec<MethodDefinition>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, ts_rs::TS)]
 #[serde(default, rename_all = "camelCase")]
+#[ts(export, export_to = "gen_grpc.ts")]
 pub struct MethodDefinition {
     pub name: String,
     pub schema: String,
@@ -37,7 +39,7 @@ pub struct MethodDefinition {
 static SERIALIZE_OPTIONS: &'static SerializeOptions =
     &SerializeOptions::new().skip_default_fields(false).stringify_64_bit_integers(false);
 
-pub fn serialize_message(msg: &DynamicMessage) -> Result<String, String> {
+pub(crate) fn serialize_dynamic_message_json(msg: &DynamicMessage) -> Result<String, String> {
     let mut buf = Vec::new();
     let mut se = serde_json::Serializer::pretty(&mut buf);
     msg.serialize_with_options(&mut se, SERIALIZE_OPTIONS).map_err(|e| e.to_string())?;

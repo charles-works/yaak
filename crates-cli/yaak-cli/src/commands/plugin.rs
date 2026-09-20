@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use walkdir::WalkDir;
@@ -27,6 +28,11 @@ use zip::write::SimpleFileOptions;
 type CommandResult<T = ()> = std::result::Result<T, String>;
 
 const KEYRING_USER: &str = "yaak";
+const METADATA_NODE_BIN: &str = "node";
+const PLUGIN_RUNTIME_NODE_VERSION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../packages/plugin-runtime/.node-version"
+));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Environment {
@@ -103,6 +109,16 @@ pub async fn run_publish(args: PluginPathArg) -> i32 {
     }
 }
 
+pub async fn run_metadata(args: PluginPathArg) -> i32 {
+    match metadata(args) {
+        Ok(()) => 0,
+        Err(error) => {
+            ui::error(&error);
+            1
+        }
+    }
+}
+
 async fn build(args: PluginPathArg) -> CommandResult {
     let plugin_dir = resolve_plugin_dir(args.path)?;
     ensure_plugin_build_inputs(&plugin_dir)?;
@@ -112,7 +128,18 @@ async fn build(args: PluginPathArg) -> CommandResult {
     for warning in warnings {
         ui::warning(&warning);
     }
+    generate_plugin_metadata(&plugin_dir)?;
     ui::success(&format!("Built plugin bundle at {}", plugin_dir.join("build/index.js").display()));
+    Ok(())
+}
+
+fn metadata(args: PluginPathArg) -> CommandResult {
+    let plugin_dir = resolve_plugin_dir(args.path)?;
+    generate_plugin_metadata(&plugin_dir)?;
+    ui::success(&format!(
+        "Generated plugin metadata at {}",
+        plugin_dir.join("build/metadata.json").display()
+    ));
     Ok(())
 }
 
@@ -153,7 +180,19 @@ async fn dev(args: PluginPathArg) -> CommandResult {
                         });
                     ui::info(&format!("Rebuilding plugin {display_path}"));
                 }
-                WatcherEvent::Event(BundleEvent::BundleEnd(_)) => {}
+                WatcherEvent::Event(BundleEvent::BundleEnd(_)) => {
+                    // Assets are staged on every rebuild, so a changed asset or
+                    // declaration is picked up without restarting.
+                    let result = copy_build_assets(&watch_root)
+                        .and_then(|()| generate_plugin_metadata(&watch_root));
+                    match result {
+                        Ok(()) => ui::success(&format!(
+                            "Generated plugin metadata at {}",
+                            watch_root.join("build/metadata.json").display()
+                        )),
+                        Err(error) => ui::error(&error),
+                    }
+                }
                 WatcherEvent::Event(BundleEvent::Error(event)) => {
                     if event.error.diagnostics.is_empty() {
                         ui::error("Plugin build failed");
@@ -228,6 +267,7 @@ async fn publish(args: PluginPathArg) -> CommandResult {
     for warning in warnings {
         ui::warning(&warning);
     }
+    generate_plugin_metadata(&plugin_dir)?;
 
     ui::info("Archiving plugin");
     let archive = create_publish_archive(&plugin_dir)?;
@@ -308,17 +348,19 @@ async fn install_from_directory(context: &CliContext, source: &str) -> CommandRe
     ui::info(&format!("Installing plugin from directory {}", plugin_dir.display()));
 
     let plugin = context
-        .db()
-        .upsert_plugin(
-            &Plugin {
-                directory: plugin_dir_str,
-                url: None,
-                enabled: true,
-                source: PluginSource::Filesystem,
-                ..Default::default()
-            },
-            &UpdateSource::Background,
-        )
+        .query_manager()
+        .with_tx(|tx| {
+            tx.upsert_plugin(
+                &Plugin {
+                    directory: plugin_dir_str,
+                    url: None,
+                    enabled: true,
+                    source: PluginSource::Filesystem,
+                    ..Default::default()
+                },
+                &UpdateSource::Background,
+            )
+        })
         .map_err(|err| format!("Failed to save plugin in database: {err}"))?;
 
     let plugin_context = PluginContext::new(Some("cli".to_string()), None);
@@ -372,11 +414,85 @@ struct PublishResponse {
 
 async fn build_plugin_bundle(plugin_dir: &Path) -> CommandResult<Vec<String>> {
     prepare_build_output_dir(plugin_dir)?;
+    copy_build_assets(plugin_dir)?;
     let mut bundler = Bundler::new(bundler_options(plugin_dir, false))
         .map_err(|err| format!("Failed to initialize Rolldown: {err}"))?;
     let output = bundler.write().await.map_err(|err| format!("Plugin build failed:\n{err}"))?;
 
     Ok(output.warnings.into_iter().map(|w| w.to_string()).collect())
+}
+
+fn generate_plugin_metadata(plugin_dir: &Path) -> CommandResult {
+    let entry_path = plugin_dir.join("build/index.js");
+    if !entry_path.is_file() {
+        return Err("build/index.js does not exist. Run `yaak plugin build` first.".to_string());
+    }
+
+    ensure_metadata_node_version()?;
+
+    let metadata_path = plugin_dir.join("build/metadata.json");
+    let output = Command::new(METADATA_NODE_BIN)
+        .arg("-e")
+        .arg(METADATA_SCRIPT)
+        .arg(entry_path.canonicalize().map_err(|e| {
+            format!("Failed to resolve plugin entrypoint {}: {e}", entry_path.display())
+        })?)
+        .arg(&metadata_path)
+        .current_dir(plugin_dir)
+        .output()
+        .map_err(|e| format!("Failed to run Node.js to generate plugin metadata: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if stderr.is_empty() {
+            format!("Node.js exited with status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(format!("Failed to generate plugin metadata: {message}"));
+    }
+
+    Ok(())
+}
+
+fn ensure_metadata_node_version() -> CommandResult {
+    let minimum_major = PLUGIN_RUNTIME_NODE_VERSION
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .ok_or_else(|| {
+            format!(
+                "Invalid plugin runtime Node.js version {:?} in packages/plugin-runtime/.node-version",
+                PLUGIN_RUNTIME_NODE_VERSION.trim()
+            )
+        })?;
+    let output = Command::new(METADATA_NODE_BIN)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("Node.js {minimum_major} or newer is required: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "`{METADATA_NODE_BIN} --version` failed with status {}",
+            output.status
+        ));
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let major = version
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .ok_or_else(|| format!("Could not parse Node.js version {version:?}"))?;
+
+    if major >= minimum_major {
+        return Ok(());
+    }
+
+    Err(format!("Node.js {minimum_major} or newer is required. Found {version}."))
 }
 
 fn prepare_build_output_dir(plugin_dir: &Path) -> CommandResult {
@@ -387,6 +503,63 @@ fn prepare_build_output_dir(plugin_dir: &Path) -> CommandResult {
     }
     fs::create_dir_all(&build_dir)
         .map_err(|e| format!("Failed to create build directory {}: {e}", build_dir.display()))
+}
+
+#[derive(Deserialize, Default)]
+struct PluginManifest {
+    #[serde(default)]
+    yaak: PluginManifestConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct PluginManifestConfig {
+    /// Files to place beside the bundle, as paths relative to the plugin
+    /// directory. Publishing ships everything in `build/`, so these travel with
+    /// the plugin.
+    #[serde(default, rename = "buildAssets")]
+    build_assets: Vec<String>,
+}
+
+/// Copy the plugin's declared assets into `build/`.
+///
+/// This runs after the directory is cleared and before the bundle is written,
+/// because a bundle may read an asset from its own directory at import time and
+/// metadata generation imports the bundle.
+fn copy_build_assets(plugin_dir: &Path) -> CommandResult {
+    let manifest_path = plugin_dir.join("package.json");
+    let manifest: PluginManifest = serde_json::from_str(
+        &fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("Failed to read {}: {e}", manifest_path.display()))?,
+    )
+    .map_err(|e| format!("Failed to parse {}: {e}", manifest_path.display()))?;
+
+    let build_dir = plugin_dir.join("build");
+    let mut names = HashSet::new();
+    for asset in manifest.yaak.build_assets {
+        let src = plugin_dir.join(&asset);
+        let name = src
+            .file_name()
+            .ok_or_else(|| format!("yaak.buildAssets entry is not a file path: {asset}"))?;
+        // A copy that later gets overwritten would pass the build and fail on
+        // load, so anything the build itself writes, or a second asset with
+        // the same name, is rejected up front. Names are compared without
+        // case, because a plugin is installed on case-insensitive filesystems
+        // wherever it was built.
+        let key = name.to_string_lossy().to_lowercase();
+        if key == "index.js" || key == "metadata.json" {
+            return Err(format!("Build asset {asset} would be overwritten by the build output"));
+        }
+        if !names.insert(key) {
+            return Err(format!("Two build assets share the name {}", name.display()));
+        }
+        if !src.is_file() {
+            return Err(format!("Build asset does not exist: {}", src.display()));
+        }
+        fs::copy(&src, build_dir.join(name))
+            .map_err(|e| format!("Failed to copy build asset {}: {e}", src.display()))?;
+    }
+
+    Ok(())
 }
 
 fn bundler_options(plugin_dir: &Path, watch: bool) -> BundlerOptions {
@@ -578,6 +751,11 @@ const TEMPLATE_PACKAGE_JSON: &str = r#"{
 }
 "#;
 
+const METADATA_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../packages/plugin-runtime/src/metadata.ts"
+));
+
 const TEMPLATE_TSCONFIG: &str = r#"{
   "compilerOptions": {
     "target": "es2021",
@@ -636,7 +814,11 @@ describe("Example Plugin", () => {
 
 #[cfg(test)]
 mod tests {
-    use super::create_publish_archive;
+    use super::{
+        copy_build_assets, create_publish_archive, generate_plugin_metadata,
+        prepare_build_output_dir,
+    };
+    use serde_json::Value;
     use std::collections::HashSet;
     use std::fs;
     use std::io::Cursor;
@@ -659,6 +841,7 @@ mod tests {
             .expect("write src/index.ts");
         fs::write(root.join("build/index.js"), "exports.plugin = {};\n")
             .expect("write build/index.js");
+        fs::write(root.join("build/metadata.json"), "{}\n").expect("write build/metadata.json");
         fs::write(root.join("ignored/secret.txt"), "do-not-ship").expect("write ignored file");
 
         let archive = create_publish_archive(root).expect("create archive");
@@ -673,8 +856,163 @@ mod tests {
         assert!(names.contains("README.md"));
         assert!(names.contains("package.json"));
         assert!(names.contains("package-lock.json"));
+        assert!(names.contains("build/metadata.json"));
         assert!(names.contains("src/index.ts"));
         assert!(names.contains("build/index.js"));
         assert!(!names.contains("ignored/secret.txt"));
+    }
+
+    #[test]
+    fn prepare_build_output_dir_clears_stale_output() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        let build = root.join("build");
+        fs::create_dir_all(&build).expect("create build");
+        fs::write(build.join("index.js"), "stale").expect("write index.js");
+        fs::write(build.join("left-behind.js"), "stale").expect("write extra");
+
+        prepare_build_output_dir(root).expect("prepare build dir");
+
+        // Publishing ships everything under build/, so nothing may survive.
+        assert!(build.is_dir());
+        assert_eq!(fs::read_dir(&build).expect("read build").count(), 0);
+    }
+
+    #[test]
+    fn copy_build_assets_places_declared_files_beside_the_bundle() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("build")).expect("create build");
+        fs::create_dir_all(root.join("vendor")).expect("create vendor");
+        fs::write(root.join("vendor/core_bg.wasm"), "asset").expect("write asset");
+        fs::write(root.join("package.json"), r#"{"yaak":{"buildAssets":["vendor/core_bg.wasm"]}}"#)
+            .expect("write package.json");
+
+        copy_build_assets(root).expect("copy assets");
+
+        assert_eq!(
+            fs::read_to_string(root.join("build/core_bg.wasm")).expect("read copied asset"),
+            "asset"
+        );
+    }
+
+    #[test]
+    fn copy_build_assets_is_a_noop_without_declarations() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("build")).expect("create build");
+        fs::write(root.join("package.json"), r#"{"name":"demo"}"#).expect("write package.json");
+
+        copy_build_assets(root).expect("copy assets");
+
+        assert_eq!(fs::read_dir(root.join("build")).expect("read build").count(), 0);
+    }
+
+    #[test]
+    fn copy_build_assets_rejects_names_the_build_writes() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("build")).expect("create build");
+        fs::write(root.join("index.js"), "asset").expect("write asset");
+        fs::write(root.join("package.json"), r#"{"yaak":{"buildAssets":["index.js"]}}"#)
+            .expect("write package.json");
+
+        let err = copy_build_assets(root).expect_err("reserved name should fail");
+        assert!(err.contains("overwritten by the build output"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn copy_build_assets_rejects_duplicate_names() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("build")).expect("create build");
+        fs::create_dir_all(root.join("a")).expect("create a");
+        fs::create_dir_all(root.join("b")).expect("create b");
+        // Differ only by case: one file on macOS and Windows.
+        fs::write(root.join("a/core.wasm"), "one").expect("write a");
+        fs::write(root.join("b/Core.wasm"), "two").expect("write b");
+        fs::write(
+            root.join("package.json"),
+            r#"{"yaak":{"buildAssets":["a/core.wasm","b/Core.wasm"]}}"#,
+        )
+        .expect("write package.json");
+
+        let err = copy_build_assets(root).expect_err("duplicate name should fail");
+        assert!(err.contains("share the name"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn copy_build_assets_fails_on_a_missing_asset() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("build")).expect("create build");
+        fs::write(root.join("package.json"), r#"{"yaak":{"buildAssets":["nope.wasm"]}}"#)
+            .expect("write package.json");
+
+        let err = copy_build_assets(root).expect_err("missing asset should fail");
+        assert!(err.contains("Build asset does not exist"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn generate_plugin_metadata_detects_api_types() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("build")).expect("create build");
+        fs::write(
+            root.join("build/index.js"),
+            r##"
+exports.plugin = {
+  themes: [{
+    id: "midnight",
+    label: "Midnight",
+    dark: true,
+    base: { surface: "#000000", text: "#ffffff" },
+  }],
+  templateFunctions: [{
+    name: "signature",
+    description: "Create a signature",
+    args: [{ type: "text", name: "secret", dynamic() {} }],
+    onRender() {},
+  }],
+  workspaceActions: [{
+    label: "Sync workspace",
+    icon: "info",
+    onSelect() {},
+  }],
+  folderActions: [{
+    label: "Export folder",
+    icon: "copy",
+    onSelect() {},
+  }],
+  async init() {},
+};
+"##,
+        )
+        .expect("write build/index.js");
+
+        generate_plugin_metadata(root).expect("generate metadata");
+
+        let contents = fs::read_to_string(root.join("build/metadata.json")).expect("read metadata");
+        let metadata: Value = serde_json::from_str(&contents).expect("metadata json");
+        let api_types = metadata["apiTypes"].as_array().expect("apiTypes array");
+
+        for expected in [
+            "folderActions",
+            "templateFunctions",
+            "themes",
+            "workspaceActions",
+            "lifecycle",
+        ] {
+            assert!(
+                api_types.iter().any(|value| value.as_str() == Some(expected)),
+                "missing api type {expected}: {api_types:?}"
+            );
+        }
+
+        assert_eq!(metadata["apis"]["themes"]["items"][0]["id"], "midnight");
+        assert_eq!(metadata["apis"]["workspaceActions"]["items"][0]["label"], "Sync workspace");
+        assert_eq!(metadata["apis"]["lifecycle"]["items"][0]["name"], "init");
+        assert!(metadata["apis"]["templateFunctions"]["items"][0]["onRender"].is_null());
+        assert!(metadata["apis"]["templateFunctions"]["items"][0]["args"][0]["dynamic"].is_null());
     }
 }

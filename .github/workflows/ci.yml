@@ -30,4 +30,8 @@ jobs:
       - name: Run JS Tests
         run: vp test
       - name: Run Rust Tests
-        run: cargo test --all
+        run: cargo test --all --features yaak-app-client/wry
+      - name: OpenAPI import round-trip
+        run: |
+          cargo build -p yaak-cli
+          node plugins/importer-openapi/tests/roundtrip.mjs

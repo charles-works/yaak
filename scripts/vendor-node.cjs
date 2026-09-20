@@ -1,12 +1,13 @@
 const path = require("node:path");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const decompress = require("decompress");
 const Downloader = require("nodejs-file-downloader");
+const { extractArchive } = require("./extract-archive.cjs");
 const { rmSync, cpSync, mkdirSync, existsSync } = require("node:fs");
 const { execSync } = require("node:child_process");
 
-const NODE_VERSION = "v24.11.1";
+const nodeVersionFile = path.join(__dirname, "..", "packages", "plugin-runtime", ".node-version");
+const NODE_VERSION = `v${fs.readFileSync(nodeVersionFile, "utf8").trim().replace(/^v/, "")}`;
 
 // `${process.platform}_${process.arch}`
 const MAC_ARM = "darwin_arm64";
@@ -54,7 +55,7 @@ const SHA256_MAP = {
 
 const key = `${process.platform}_${process.env.YAAK_TARGET_ARCH ?? process.arch}`;
 
-const destDir = path.join(__dirname, `..`, "crates-tauri", "yaak-app", "vendored", "node");
+const destDir = path.join(__dirname, `..`, "crates-tauri", "yaak-app-client", "vendored", "node");
 const binDest = path.join(destDir, DST_BIN_MAP[key]);
 console.log(`Vendoring NodeJS ${NODE_VERSION} for ${key}`);
 
@@ -91,7 +92,7 @@ rmSync(tmpDir, { recursive: true, force: true });
   console.log("SHA256 verified:", actualHash);
 
   // Decompress to the same directory
-  await decompress(filePath, tmpDir, {});
+  await extractArchive(filePath, tmpDir);
 
   // Copy binary
   const binSrc = path.join(tmpDir, SRC_BIN_MAP[key]);
